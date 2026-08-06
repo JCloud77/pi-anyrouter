@@ -1,5 +1,5 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { randomBytes, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -11,16 +11,19 @@ import {
   type AssistantMessage,
   type AssistantMessageEventStream,
   type Context,
-  type Message,
   type Model,
   type SimpleStreamOptions,
   type StopReason,
   type TextContent,
-  type ThinkingContent,
   type Tool,
   type ToolResultMessage,
   type ImageContent,
 } from "@earendil-works/pi-ai";
+import { readClaudeProfile } from "./src/claude-profile.ts";
+import { buildClaudeRequest, createClaudeHeaders } from "./src/claude-request.ts";
+import { ClaudeToolRegistry } from "./src/claude-tools.ts";
+import { getRetryDelayMs, isRetryableStatus, parseRetryAfterMs } from "./src/retry.ts";
+import { nextSseChunk, parseSseEvent } from "./src/sse.ts";
 
 type Json = Record<string, any>;
 type StreamMode = "off" | "auto" | "force";
@@ -41,6 +44,11 @@ type ProviderConfigFile = {
   baseUrl?: string;
   apiKey?: string;
   models?: ProviderModelConfig[];
+  claudeProfile?: string;
+  claudeTransport?: "fetch" | "curl-http2";
+  claudeToolProfile?: "executable" | "compatible-core" | "full-official";
+  claudeOfficialTools?: string[];
+  claudePiInstructions?: "omit" | "user-reminder";
 };
 
 const DEFAULT_CONFIG_PATH = join(homedir(), ".pi", "agent", "anyrouter.json");
@@ -51,47 +59,8 @@ const PROVIDER_NAME = "anyrouter";
 const API_ID = "anyrouter-messages" as Api;
 const DEBUG_ENABLED = process.env.PI_ANYROUTER_CC_DEBUG === "1";
 const DEBUG_DIR = process.env.PI_ANYROUTER_CC_DEBUG_DIR || join(process.cwd(), ".pi", "anyrouter-cc-debug");
-// Captured from the locally installed Claude Code on 2026-07-11.
-const CLAUDE_CODE_VERSION = "2.1.206";
-const CLAUDE_CODE_VERSION_BUILD = "2.1.206.3ee";
-const STAINLESS_PACKAGE_VERSION = "0.94.0";
-const STAINLESS_OS = "Linux";
-const STAINLESS_ARCH = "x64";
-const STAINLESS_RUNTIME = "node";
-const STAINLESS_RUNTIME_VERSION = "v26.3.0";
-const ANTHROPIC_BETA = "claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24";
-const CLAUDE_DEVICE_ID = randomBytes(32).toString("hex");
 const CODEX_VERSION = "0.144.1";
 const CODEX_INSTALLATION_ID = randomUUID();
-
-const NAME_MAP: Record<string, string> = {
-  read: "Read",
-  write: "Write",
-  edit: "Edit",
-  bash: "Bash",
-  grep: "Grep",
-  find: "Glob",
-  glob: "Glob",
-  ls: "LS",
-  todowrite: "TodoWrite",
-  webfetch: "WebFetch",
-  websearch: "WebSearch",
-  google_search: "Google_Search",
-};
-
-function toClaudeCodeName(name?: string | null) {
-  if (!name || typeof name !== "string") return name;
-  return NAME_MAP[name.toLowerCase()] ?? name.charAt(0).toUpperCase() + name.slice(1);
-}
-
-function fromClaudeCodeName(name?: string | null) {
-  if (!name || typeof name !== "string") return name;
-  const lower = name.toLowerCase();
-  for (const [from, to] of Object.entries(NAME_MAP)) {
-    if (to.toLowerCase() === lower) return from;
-  }
-  return name.charAt(0).toLowerCase() + name.slice(1);
-}
 
 function sanitizeText(text: string) {
   return text.replace(/[\uD800-\uDFFF]/g, "\uFFFD");
@@ -123,98 +92,48 @@ function loadSourceProvider() {
   const baseUrl = process.env.PI_ANYROUTER_CC_BASE_URL || parsed.baseUrl;
   const apiKey = process.env.PI_ANYROUTER_CC_API_KEY || resolveConfigValue(parsed.apiKey);
   const models = parsed.models || [];
+  const claudeProfile = process.env.PI_ANYROUTER_CC_PROFILE || parsed.claudeProfile;
+  const claudeTransport = process.env.PI_ANYROUTER_CC_TRANSPORT || parsed.claudeTransport || "fetch";
+  const claudeToolProfileValue = process.env.PI_ANYROUTER_CC_TOOL_PROFILE || parsed.claudeToolProfile || "compatible-core";
+  const envOfficialTools = process.env.PI_ANYROUTER_CC_OFFICIAL_TOOLS;
+  const claudeOfficialTools = envOfficialTools
+    ? envOfficialTools.split(",").map((name) => name.trim()).filter(Boolean)
+    : parsed.claudeOfficialTools;
+  const claudePiInstructionsValue = process.env.PI_ANYROUTER_CC_PI_INSTRUCTIONS
+    || parsed.claudePiInstructions
+    || (claudeToolProfileValue === "compatible-core" ? "user-reminder" : "omit");
 
   if (!baseUrl) throw new Error(`Missing baseUrl in ${CONFIG_PATH}. You can also set PI_ANYROUTER_CC_BASE_URL.`);
   if (!apiKey) throw new Error(`Missing apiKey in ${CONFIG_PATH}. You can also set PI_ANYROUTER_CC_API_KEY.`);
   if (!models.length) throw new Error(`No models configured in ${CONFIG_PATH}. Add at least one model entry.`);
 
-  return { baseUrl, apiKey, models };
-}
-
-function convertContentBlocks(content: (TextContent | ImageContent)[]) {
-  const hasImages = content.some((c) => c.type === "image");
-  if (!hasImages) return sanitizeText(content.map((c) => (c as TextContent).text).join("\n"));
-
-  const blocks = content.map((block) => {
-    if (block.type === "text") return { type: "text", text: sanitizeText(block.text) };
-    return { type: "image", source: { type: "base64", media_type: block.mimeType, data: block.data } };
-  });
-  if (!blocks.some((b) => b.type === "text")) blocks.unshift({ type: "text", text: "(see attached image)" });
-  return blocks;
-}
-
-function convertMessages(messages: Message[]) {
-  const params: any[] = [];
-  for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
-    if (msg.role === "user") {
-      if (typeof msg.content === "string") {
-        const text = sanitizeText(msg.content);
-        if (text.trim()) params.push({ role: "user", content: [{ type: "text", text }] });
-      } else {
-        const blocks = msg.content.map((item) =>
-          item.type === "text"
-            ? { type: "text", text: sanitizeText(item.text) }
-            : { type: "image", source: { type: "base64", media_type: item.mimeType, data: item.data } },
-        );
-        if (blocks.length > 0) params.push({ role: "user", content: blocks });
-      }
-      continue;
+  if (claudeTransport !== "fetch" && claudeTransport !== "curl-http2") {
+    throw new Error(`Unsupported claudeTransport ${claudeTransport}; expected fetch or curl-http2.`);
+  }
+  if (claudeToolProfileValue !== "executable" && claudeToolProfileValue !== "compatible-core" && claudeToolProfileValue !== "full-official") {
+    throw new Error(`Unsupported claudeToolProfile ${claudeToolProfileValue}; expected executable, compatible-core, or full-official.`);
+  }
+  const claudeToolProfile: "executable" | "compatible-core" | "full-official" = claudeToolProfileValue;
+  if (claudePiInstructionsValue !== "omit" && claudePiInstructionsValue !== "user-reminder") {
+    throw new Error(`Unsupported claudePiInstructions ${claudePiInstructionsValue}; expected omit or user-reminder.`);
+  }
+  const claudePiInstructions: "omit" | "user-reminder" = claudePiInstructionsValue;
+  if (claudePiInstructions === "user-reminder" && claudeToolProfile !== "compatible-core") {
+    throw new Error("claudePiInstructions=user-reminder is only valid with claudeToolProfile=compatible-core.");
+  }
+  if (claudeOfficialTools !== undefined) {
+    if (!Array.isArray(claudeOfficialTools) || claudeOfficialTools.length === 0 || claudeOfficialTools.some((name) => typeof name !== "string" || !name.trim())) {
+      throw new Error("claudeOfficialTools must be a non-empty array of tool names when provided.");
     }
-
-    if (msg.role === "assistant") {
-      const blocks: any[] = [];
-      for (const block of msg.content) {
-        if (block.type === "text" && block.text.trim()) blocks.push({ type: "text", text: sanitizeText(block.text) });
-        else if (block.type === "thinking" && block.thinking.trim()) {
-          if ((block as ThinkingContent).thinkingSignature) {
-            blocks.push({ type: "thinking", thinking: sanitizeText(block.thinking), signature: (block as ThinkingContent).thinkingSignature });
-          } else {
-            blocks.push({ type: "text", text: sanitizeText(block.thinking) });
-          }
-        } else if (block.type === "toolCall") {
-          blocks.push({ type: "tool_use", id: block.id, name: toClaudeCodeName(block.name), input: block.arguments });
-        }
-      }
-      if (blocks.length > 0) params.push({ role: "assistant", content: blocks });
-      continue;
+    if (new Set(claudeOfficialTools).size !== claudeOfficialTools.length) {
+      throw new Error("claudeOfficialTools must not contain duplicates.");
     }
-
-    if (msg.role === "toolResult") {
-      const toolResults: any[] = [];
-      const pushToolResult = (toolMsg: ToolResultMessage) => {
-        toolResults.push({ type: "tool_result", tool_use_id: toolMsg.toolCallId, content: convertContentBlocks(toolMsg.content), is_error: toolMsg.isError });
-      };
-      pushToolResult(msg as ToolResultMessage);
-      let j = i + 1;
-      while (j < messages.length && messages[j].role === "toolResult") {
-        pushToolResult(messages[j] as ToolResultMessage);
-        j++;
-      }
-      i = j - 1;
-      params.push({ role: "user", content: toolResults });
+    if (claudeToolProfile !== "full-official") {
+      throw new Error("claudeOfficialTools is only valid when claudeToolProfile is full-official.");
     }
   }
 
-  if (params.length > 0) {
-    const last = params[params.length - 1];
-    if (last.role === "user" && Array.isArray(last.content) && last.content.length > 0) {
-      last.content[last.content.length - 1].cache_control = { type: "ephemeral" };
-    }
-  }
-  return params;
-}
-
-function convertTools(tools: Tool[]) {
-  return tools.map((tool) => ({
-    name: toClaudeCodeName(tool.name),
-    description: tool.description,
-    input_schema: {
-      type: "object",
-      properties: (tool.parameters as any).properties || {},
-      required: (tool.parameters as any).required || [],
-    },
-  }));
+  return { baseUrl, apiKey, models, claudeProfile, claudeTransport, claudeToolProfile, claudeOfficialTools, claudePiInstructions };
 }
 
 function mapReasoningEffort(level?: SimpleStreamOptions["reasoning"]) {
@@ -237,46 +156,6 @@ function mapStopReason(reason: string): StopReason {
     case "tool_use": return "toolUse";
     default: return "error";
   }
-}
-
-function getClaudeCodeHeaders(apiKey: string, retryCount = 0, sessionId: string) {
-  return {
-    "content-type": "application/json",
-    accept: "application/json",
-    authorization: `Bearer ${apiKey}`,
-    "anthropic-version": "2023-06-01",
-    "anthropic-dangerous-direct-browser-access": "true",
-    "anthropic-beta": ANTHROPIC_BETA,
-    "user-agent": `claude-cli/${CLAUDE_CODE_VERSION} (external, sdk-cli)`,
-    "x-app": "cli",
-    "x-claude-code-session-id": sessionId,
-    "x-stainless-retry-count": String(retryCount),
-    "x-stainless-timeout": "600",
-    "x-stainless-lang": "js",
-    "x-stainless-package-version": STAINLESS_PACKAGE_VERSION,
-    "x-stainless-os": STAINLESS_OS,
-    "x-stainless-arch": STAINLESS_ARCH,
-    "x-stainless-runtime": STAINLESS_RUNTIME,
-    "x-stainless-runtime-version": STAINLESS_RUNTIME_VERSION,
-  };
-}
-
-function createClaudeCodeMetadata(sessionId: string) {
-  return {
-    user_id: JSON.stringify({
-      device_id: CLAUDE_DEVICE_ID,
-      account_uuid: "",
-      session_id: sessionId,
-    }),
-  };
-}
-
-function createClaudeCodeSystem(systemPrompt: string) {
-  return [
-    { type: "text", text: `x-anthropic-billing-header: cc_version=${CLAUDE_CODE_VERSION_BUILD}; cc_entrypoint=sdk-cli;` },
-    { type: "text", text: "You are a Claude agent, built on Anthropic's Claude Agent SDK.", cache_control: { type: "ephemeral" } },
-    { type: "text", text: sanitizeText(systemPrompt), cache_control: { type: "ephemeral" } },
-  ];
 }
 
 function redactHeaders(headers: Record<string, string>) {
@@ -322,39 +201,16 @@ function fetchWithProxy(url: string, init: FetchInit) {
 
 function writeDebugFile(kind: "request" | "response" | "error", modelId: string, requestId: string | undefined, payload: Json) {
   if (!DEBUG_ENABLED) return;
-  mkdirSync(DEBUG_DIR, { recursive: true });
+  mkdirSync(DEBUG_DIR, { recursive: true, mode: 0o700 });
   const safeModel = modelId.replace(/[^a-zA-Z0-9._-]+/g, "_");
   const safeRequestId = (requestId || "no-request-id").replace(/[^a-zA-Z0-9._-]+/g, "_");
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const path = join(DEBUG_DIR, `${timestamp}-${safeModel}-${safeRequestId}-${kind}.json`);
-  writeFileSync(path, JSON.stringify(payload, null, 2), "utf8");
+  writeFileSync(path, JSON.stringify(payload, null, 2), { encoding: "utf8", mode: 0o600 });
 }
 
 function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function isRetryableStatus(status: number) {
-  return [408, 409, 429, 500, 502, 503, 504, 520, 522, 524].includes(status);
-}
-
-function parseRetryAfterMs(value: string | null) {
-  if (!value) return undefined;
-  const seconds = Number(value);
-  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
-  const at = Date.parse(value);
-  if (Number.isFinite(at)) {
-    const delta = at - Date.now();
-    return delta > 0 ? delta : 0;
-  }
-  return undefined;
-}
-
-function getRetryDelayMs(attempt: number, retryAfterMs?: number) {
-  if (typeof retryAfterMs === "number") return Math.max(0, Math.min(retryAfterMs, 30_000));
-  const base = Math.min(1000 * (2 ** attempt), 15_000);
-  const jitter = Math.floor(Math.random() * 250);
-  return base + jitter;
 }
 
 function getStreamMode(): StreamMode {
@@ -721,7 +577,7 @@ async function tryStreamAnyRouterCodex(url: string, body: Json, apiKey: string, 
   });
 }
 
-function applyJsonResponseToOutput(response: any, output: AssistantMessage, stream: AssistantMessageEventStream, model: Model<Api>) {
+function applyJsonResponseToOutput(response: any, output: AssistantMessage, stream: AssistantMessageEventStream, model: Model<Api>, registry: ClaudeToolRegistry) {
   updateUsageFromAnthropic(output, response?.usage || {}, model);
   output.stopReason = mapStopReason(response?.stop_reason || "end_turn");
 
@@ -742,7 +598,8 @@ function applyJsonResponseToOutput(response: any, output: AssistantMessage, stre
       if (block.thinking) stream.push({ type: "thinking_delta", contentIndex, delta: String(block.thinking), partial: output });
       stream.push({ type: "thinking_end", contentIndex, content: String(block.thinking || ""), partial: output });
     } else if (block?.type === "tool_use") {
-      const toolCall = { type: "toolCall" as const, id: block.id, name: fromClaudeCodeName(block.name), arguments: block.input || {} };
+      const mapped = registry.fromWireToolCall(block.name, block.input || {});
+      const toolCall = { type: "toolCall" as const, id: block.id, name: mapped.name, arguments: mapped.arguments };
       output.content.push(toolCall as any);
       const contentIndex = output.content.length - 1;
       stream.push({ type: "toolcall_start", contentIndex, partial: output });
@@ -752,28 +609,7 @@ function applyJsonResponseToOutput(response: any, output: AssistantMessage, stre
   }
 }
 
-function parseSseEvent(chunk: string) {
-  let event = "message";
-  const data: string[] = [];
-  for (const line of chunk.split(/\r?\n/)) {
-    if (!line || line.startsWith(":")) continue;
-    if (line.startsWith("event:")) event = line.slice(6).trim();
-    else if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
-  }
-  return { event, data: data.join("\n") };
-}
-
-function nextSseChunk(buffer: string) {
-  const unix = buffer.indexOf("\n\n");
-  const dos = buffer.indexOf("\r\n\r\n");
-  if (unix === -1 && dos === -1) return undefined;
-  if (dos !== -1 && (unix === -1 || dos < unix)) {
-    return { chunk: buffer.slice(0, dos), rest: buffer.slice(dos + 4) };
-  }
-  return { chunk: buffer.slice(0, unix), rest: buffer.slice(unix + 2) };
-}
-
-function applySsePayloadEvent(payload: any, output: AssistantMessage, stream: AssistantMessageEventStream, model: Model<Api>, blockIndexByEventIndex: Map<number, number>) {
+function applySsePayloadEvent(payload: any, output: AssistantMessage, stream: AssistantMessageEventStream, model: Model<Api>, blockIndexByEventIndex: Map<number, number>, registry: ClaudeToolRegistry) {
   if (!payload?.type || payload.type === "ping" || payload.type === "message_stop") return;
 
   if (payload.type === "error") {
@@ -813,7 +649,8 @@ function applySsePayloadEvent(payload: any, output: AssistantMessage, stream: As
       const toolCall = {
         type: "toolCall" as const,
         id: block.id,
-        name: fromClaudeCodeName(block.name),
+        name: registry.getPiName(block.name),
+        wireName: block.name,
         arguments: (block.input as Json) || {},
         partialJson: "",
         eventIndex: payload.index,
@@ -883,6 +720,10 @@ function applySsePayloadEvent(payload: any, output: AssistantMessage, stream: As
           block.arguments = block.arguments || {};
         }
       }
+      const mapped = registry.fromWireToolCall(block.wireName, block.arguments);
+      block.name = mapped.name;
+      block.arguments = mapped.arguments;
+      delete block.wireName;
       delete block.partialJson;
       stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial: output });
     }
@@ -895,15 +736,14 @@ function applySsePayloadEvent(payload: any, output: AssistantMessage, stream: As
   }
 }
 
-async function tryStreamAnyRouterCc(url: string, body: Json, apiKey: string, model: Model<Api>, output: AssistantMessage, stream: AssistantMessageEventStream, sessionId: string, signal?: AbortSignal) {
+async function tryStreamAnyRouterCc(url: string, body: Json, headers: Record<string, string>, model: Model<Api>, output: AssistantMessage, stream: AssistantMessageEventStream, registry: ClaudeToolRegistry, signal?: AbortSignal) {
   const requestBody = { ...body, stream: true };
   const bodyText = JSON.stringify(requestBody);
   const maxRetries = Math.max(0, Number(process.env.PI_ANYROUTER_CC_MAX_RETRIES || "10") || 0);
   let response: Response | undefined;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    // Real Claude Code keeps this at zero across its application-level retries.
-    const headers = getClaudeCodeHeaders(apiKey, 0, sessionId);
+    // Real Claude Code keeps x-stainless-retry-count at zero across its application-level retries.
     if (attempt === 0) {
       writeDebugFile("request", model.id, undefined, {
         url,
@@ -980,7 +820,7 @@ async function tryStreamAnyRouterCc(url: string, body: Json, apiKey: string, mod
       if (event.data) {
         const payload = tryParseJson(event.data);
         if (!payload && event.data !== "[DONE]") throw new Error(`invalid SSE payload: ${event.data.slice(0, 200)}`);
-        if (payload) applySsePayloadEvent(payload, output, stream, model, blockIndexByEventIndex);
+        if (payload) applySsePayloadEvent(payload, output, stream, model, blockIndexByEventIndex, registry);
       }
       parsedChunk = nextSseChunk(buffer);
     }
@@ -994,7 +834,7 @@ async function tryStreamAnyRouterCc(url: string, body: Json, apiKey: string, mod
     if (event.data && event.data !== "[DONE]") {
       const payload = tryParseJson(event.data);
       if (!payload) throw new Error(`invalid SSE payload: ${event.data.slice(0, 200)}`);
-      applySsePayloadEvent(payload, output, stream, model, blockIndexByEventIndex);
+      applySsePayloadEvent(payload, output, stream, model, blockIndexByEventIndex, registry);
     }
   }
 
@@ -1012,18 +852,18 @@ async function tryStreamAnyRouterCc(url: string, body: Json, apiKey: string, mod
   });
 }
 
-async function postJson(url: string, body: Json, apiKey: string, modelId: string, sessionId: string, signal?: AbortSignal) {
+async function postJson(url: string, body: Json, headers: Record<string, string>, modelId: string, signal?: AbortSignal) {
   const maxRetries = Math.max(0, Number(process.env.PI_ANYROUTER_CC_MAX_RETRIES || "10") || 0);
-  const bodyText = JSON.stringify(body);
+  const jsonBody = { ...body, stream: false };
+  const bodyText = JSON.stringify(jsonBody);
   let lastErrorText = "";
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    const headers = getClaudeCodeHeaders(apiKey, attempt, sessionId);
     if (attempt === 0) {
       writeDebugFile("request", modelId, undefined, {
         url,
         headers: redactHeaders(headers),
-        body,
+        body: jsonBody,
       });
     }
 
@@ -1118,30 +958,29 @@ function streamAnyRouterCc(model: Model<Api>, context: Context, options?: Simple
         return;
       }
 
-      const url = `${source.baseUrl.replace(/\/$/, "")}/v1/messages?beta=true`;
-      const requestBody: Json = {
-        model: model.id,
-        messages: convertMessages(context.messages),
-        max_tokens: options?.maxTokens || model.maxTokens || 32000,
-        stream: false,
-        metadata: createClaudeCodeMetadata(sessionId),
-        system: createClaudeCodeSystem(context.systemPrompt || "You are an expert coding assistant operating inside pi."),
-        context_management: {
-          edits: [{ type: "clear_thinking_20251015", keep: "all" }],
-        },
-      };
-      if (context.tools?.length) requestBody.tools = convertTools(context.tools);
-      if (options?.reasoning && model.reasoning) {
-        requestBody.thinking = { type: "adaptive", display: "omitted" };
-        requestBody.output_config = { effort: mapReasoningEffort(options.reasoning) };
+      if (source.claudeTransport !== "fetch") {
+        throw new Error(`Claude transport ${source.claudeTransport} is not available until a controlled comparison proves it is required.`);
       }
+      const { profile } = readClaudeProfile(source.claudeProfile);
+      const url = `${source.baseUrl.replace(/\/+$/, "")}${profile.request.urlPath}`;
+      const { body: requestBody, registry } = buildClaudeRequest(
+        profile,
+        model,
+        context,
+        options,
+        sessionId,
+        source.claudeToolProfile,
+        source.claudeOfficialTools,
+        source.claudePiInstructions,
+      );
+      const headers = createClaudeHeaders(profile, source.apiKey, sessionId, source.claudeToolProfile);
 
       stream.push({ type: "start", partial: output });
 
       const streamMode = getStreamMode();
       if (streamMode !== "off") {
         try {
-          await tryStreamAnyRouterCc(url, requestBody, source.apiKey, model, output, stream, sessionId, options?.signal);
+          await tryStreamAnyRouterCc(url, requestBody, headers, model, output, stream, registry, options?.signal);
           if (options?.signal?.aborted) throw new Error("Request was aborted");
           stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
           stream.end();
@@ -1171,8 +1010,8 @@ function streamAnyRouterCc(model: Model<Api>, context: Context, options?: Simple
         }
       }
 
-      const response = await postJson(url, requestBody, source.apiKey, model.id, sessionId, options?.signal);
-      applyJsonResponseToOutput(response, output, stream, model);
+      const response = await postJson(url, requestBody, headers, model.id, options?.signal);
+      applyJsonResponseToOutput(response, output, stream, model, registry);
       stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
       stream.end();
     } catch (error) {
@@ -1188,6 +1027,11 @@ function streamAnyRouterCc(model: Model<Api>, context: Context, options?: Simple
   })();
   return stream;
 }
+
+export const __testing = {
+  buildCodexRequestBody,
+  createCodexHeaders,
+};
 
 export default function (pi: ExtensionAPI) {
   try {

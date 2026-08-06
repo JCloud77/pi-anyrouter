@@ -1,251 +1,267 @@
 # pi-anyrouter
 
-A pi provider extension that adapts requests to the client-specific shapes accepted by AnyRouter.
+An unofficial pi provider extension for AnyRouter's Claude Code and Codex Responses Lite routes.
 
-It currently supports both **Claude Code / Claude Agent SDK** requests and **Codex Responses Lite** requests. It does not require a separate local relay process.
+The Claude adapter uses a **locally generated, versioned Claude Code profile** instead of a static header snapshot. The private profile contains the exact system/tool templates captured from the Claude Code installation on the same machine; those proprietary templates are never included in this repository or npm package.
 
-## Status
+> Current development status (2026-08-04): AnyRouter accepted the minimal mapped core set `Bash/Edit/Read/WebFetch/WebSearch/Write`; Fable Read/Bash call-result loops and an Opus pi-instruction sentinel all completed successfully. Adding `Agent` alone made the same envelope return 429, showing that AnyRouter validates allowed tool combinations rather than merely requiring a minimum count. `compatible-core` + `user-reminder` is now the default Claude mode in this development checkout; activation still requires a backed-up package/config switch.
 
-Confirmed working with provider `anyrouter` using Claude and Codex model routes:
+## Scope
 
-```bash
-pi --model anyrouter/claude-opus-4-8 --no-session --no-tools -p "Reply with exactly OK"
-pi --model anyrouter/gpt-5.6-sol --no-session --no-tools -p "Reply with exactly OK"
-```
+- Registers only provider `anyrouter` with private API ID `anyrouter-messages`.
+- Reads dedicated config `~/.pi/agent/anyrouter.json`.
+- Keeps normal pi `/model` selection.
+- Leaves other pi providers and global request handling untouched.
+- Preserves the v0.3.2 Codex Responses Lite request path.
+- First profile/capture implementation targets Linux/WSL.
 
-Expected output:
+## Claude compatibility design
 
-```text
-OK
-```
+For Claude models the extension:
 
-## What this package fixes
+1. Loads a mode-`0600` local Claude Code profile.
+2. Reproduces the captured version, beta/header set, system block order, message scaffold, request defaults, and official executable tool definitions.
+3. Keeps the accepted official default system envelope unchanged and, in compatible mode, carries pi/project instructions in an official-style user reminder.
+4. Maps executable core pi tools to captured Claude Code built-ins:
+   - `read` ↔ `Read`
+   - `bash` ↔ `Bash`
+   - `edit` ↔ `Edit`
+   - `write` ↔ `Write`
+   - `web_search` ↔ `WebSearch`
+   - `fetch_content` ↔ `WebFetch`
+5. Advertises every other active pi tool using a deterministic `mcp__pi__<name>_<hash>` wire name, then maps returned calls back to the original tool.
+6. Replays the same mapping for historical tool calls in multi-turn conversations.
+7. Provides `compatible-core`, which uses the accepted official default envelope with the six safely mapped core tools.
+8. Provides an opt-in `full-official` diagnostic profile that reproduces the captured default Claude Code headers, system blocks, startup messages, request defaults, and exact tool catalog ordering.
 
-Some AnyRouter Claude endpoints, especially `claude-opus-4-6`, reject older or more generic Claude-style requests with errors like:
-
-```json
-{"error":{"type":"new_api_error","message":"invalid claude code request (...)"},"type":"error"}
-```
-
-This package selects an adapter by model family:
-
-- Claude models use `POST /v1/messages?beta=true` with Claude Code headers, system blocks, metadata, and Anthropic SSE conversion.
-- Codex models use `POST /v1/responses` with the Codex Responses Lite headers/body shape and OpenAI Responses SSE conversion.
-
-## Features
-
-- Registers provider: `anyrouter`
-- Supports Claude Code and Codex Responses Lite request validation
-- No local relay/proxy required
-- Converts tool names to Claude Code naming
-- Supports reasoning via `thinking` + `output_config`
-- Built-in request/response debug dump
-- Retries transient upstream failures like HTTP 520/502/503/504 automatically
-- Packaged so it can be shared as a pi package
+Unsupported built-in semantics fail safely rather than being silently changed. Examples include Claude `Edit.replace_all`, background Bash, and PDF page-specific Read calls.
 
 ## Install
 
-## Option A: local development checkout
-
-Clone into a normal directory:
+Install the pinned Git prerelease through pi's package manager:
 
 ```bash
-git clone https://github.com/xifan2333/pi-anyrouter.git
+pi install git:github.com/JCloud77/pi-anyrouter@v0.4.0-alpha.1
+```
+
+Pi packages execute with full user permissions. Review the source before installation. This package does not include a Claude Code profile, API key, or generated request captures; each user must create those privately on their own machine.
+
+For source development:
+
+```bash
+git clone https://github.com/JCloud77/pi-anyrouter.git
 cd pi-anyrouter
+npm install
 ```
 
-Install as a pi package from the local path:
+Test the checkout without installing it:
 
 ```bash
-pi install .
+PI_OFFLINE=1 pi --no-extensions --extension ./index.ts --list-models
 ```
 
-Or install directly from a path later:
+## Configuration
 
-```bash
-pi install /absolute/path/to/pi-anyrouter
-```
-
-## Option B: direct git install
-
-Once pushed to GitHub, install with:
-
-```bash
-pi install git:github.com/xifan2333/pi-anyrouter
-```
-
-Or pin a ref/tag:
-
-```bash
-pi install git:github.com/xifan2333/pi-anyrouter@<tag>
-```
-
-## Option C: manual extension placement
-
-If you only want the extension file layout, place it at either:
-
-- `~/.pi/agent/extensions/anyrouter/index.ts`
-- `.pi/extensions/anyrouter/index.ts`
-
-Then reload pi:
-
-```text
-/reload
-```
-
-## Config
-
-Create:
-
-- `~/.pi/agent/anyrouter.json`
-
-Example:
+Create `~/.pi/agent/anyrouter.json` with permissions `0600`:
 
 ```json
 {
   "baseUrl": "https://anyrouter.top",
-  "apiKey": "YOUR_ANYROUTER_KEY_OR_ENV_NAME",
+  "apiKey": "ANYROUTER_API_KEY_ENV_NAME",
+  "claudeProfile": "~/.pi/agent/anyrouter-profiles/claude-code-active.json",
+  "claudeToolProfile": "compatible-core",
+  "claudePiInstructions": "user-reminder",
   "models": [
     {
-      "id": "claude-opus-4-8",
-      "name": "Claude Opus 4.8",
+      "id": "claude-fable-5",
+      "name": "Claude Fable 5",
       "reasoning": true,
-      "input": ["text"],
-      "cost": {
-        "input": 0,
-        "output": 0,
-        "cacheRead": 0,
-        "cacheWrite": 0
-      },
-      "contextWindow": 200000,
-      "maxTokens": 32000
+      "input": ["text", "image"],
+      "contextWindow": 1000000,
+      "maxTokens": 128000
+    },
+    {
+      "id": "claude-opus-5",
+      "name": "Claude Opus 5",
+      "reasoning": true,
+      "input": ["text", "image"],
+      "contextWindow": 1000000,
+      "maxTokens": 128000
     }
   ]
 }
 ```
 
-You can also override config values with environment variables:
+`apiKey` may be a literal key or the name of an environment variable. Shell-command values such as `"!command"` are intentionally rejected.
+
+Supported overrides:
 
 - `PI_ANYROUTER_CC_CONFIG`
 - `PI_ANYROUTER_CC_BASE_URL`
 - `PI_ANYROUTER_CC_API_KEY`
-- `PI_ANYROUTER_CC_MAX_RETRIES` (default: `10`)
-- `PI_ANYROUTER_CC_STREAM_MODE` (default: `force`)
+- `PI_ANYROUTER_CC_PROFILE`
+- `PI_ANYROUTER_CC_TOOL_PROFILE` (`compatible-core` default, legacy `executable`, or diagnostic-only `full-official`)
+- `PI_ANYROUTER_CC_OFFICIAL_TOOLS` (optional comma-separated subset for controlled minimum-set diagnosis)
+- `PI_ANYROUTER_CC_PI_INSTRUCTIONS` (`user-reminder` default with compatible-core, or `omit`)
+- `PI_ANYROUTER_CC_MAX_RETRIES` (runtime default: `10`; use `0` for controlled probes)
+- `PI_ANYROUTER_CC_STREAM_MODE` (`force`, `auto`, or `off`; default: `force`)
+- `PI_ANYROUTER_CC_DEBUG`
+- `PI_ANYROUTER_CC_DEBUG_DIR`
 
-Notes:
+Fetch/Undici remains the only enabled Claude runtime transport. A controlled same-body comparison returned the same 429 through Fetch and `curl --http2`, so curl is not implemented as a runtime fallback.
 
-- `apiKey` can be a literal key or an environment variable name.
-- shell-command values like `"!command"` are intentionally not supported.
-- this package reads `~/.pi/agent/anyrouter.json` by default rather than `models.json`.
-- `PI_ANYROUTER_CC_STREAM_MODE=auto` tries real SSE streaming first and falls back to the old non-stream JSON path if streaming fails before any content arrives.
-- `PI_ANYROUTER_CC_STREAM_MODE=force` uses SSE only; `PI_ANYROUTER_CC_STREAM_MODE=off` disables SSE.
+## Generate the private Claude Code profile
 
-## Use
+Requirements:
 
-After installation/configuration:
+- A local `claude` executable.
+- No AnyRouter access is required.
+- The capture script uses a loopback HTTP server and a dummy credential.
+
+Run:
+
+```bash
+cd /path/to/pi-anyrouter
+npm run capture:profile
+```
+
+The script captures default tools, the core-tool subset, and an append-system marker. It writes:
+
+- `~/.pi/agent/anyrouter-profiles/claude-code-<version>.json`
+- `~/.pi/agent/anyrouter-profiles/claude-code-active.json`
+
+The directory is mode `0700`; profiles are mode `0600`. Captured authorization, host/content-length, literal user prompt, cwd, and account/session/device IDs are removed or replaced with placeholders. A new stable local device ID is generated for the private profile.
+
+Do not commit, publish, or share generated profiles. They contain locally captured proprietary Claude Code system/tool text.
+
+## Offline verification
+
+```bash
+npm test
+npm run typecheck
+npm run pack:dry-run
+```
+
+Deep-compare two captured/generated requests:
+
+```bash
+npm run diagnose -- official-request.json candidate-request.json
+```
+
+The comparator normalizes credentials and dynamic IDs, then reports header/body keys, system block hashes, message/cache layout, tool description/schema hashes, metadata, thinking, context management, output config, and stream differences.
+
+The package dry run must not include generated profiles, captures, debug dumps, tests, or secrets.
+
+## Accepted compatible core mode
+
+The smallest confirmed-safe request catalog is:
 
 ```text
-/reload
-/model
+Bash, Edit, Read, WebFetch, WebSearch, Write
 ```
 
-Choose a configured model, for example:
-
-- `anyrouter / claude-opus-4-8`
-- `anyrouter / gpt-5.6-sol`
-
-Or run directly:
+Enable its official default envelope with:
 
 ```bash
-pi --model anyrouter/gpt-5.6-sol
+PI_ANYROUTER_CC_TOOL_PROFILE=compatible-core
 ```
 
-## Debugging
+Every advertised tool has an existing pi argument/response mapping when the corresponding pi tools are active. Pi-only/MCP tools are omitted. Read and Bash call/result/final-answer loops have passed against AnyRouter.
 
-Enable request/response dumps:
+The accepted official default system envelope cannot be replaced by pi's append-system variant. To carry pi/project instructions without altering that envelope, an opt-in mode prepends them to the ordinary user-prompt block as an official-style reminder:
 
 ```bash
-PI_ANYROUTER_CC_DEBUG=1 pi --model anyrouter/gpt-5.6-sol -p "Reply with exactly OK"
+PI_ANYROUTER_CC_TOOL_PROFILE=compatible-core \
+PI_ANYROUTER_CC_PI_INSTRUCTIONS=user-reminder
 ```
 
-Optional custom debug directory:
+This keeps the captured system/startup blocks unchanged, but the instructions have user-message rather than API system precedence. AnyRouter acceptance and instruction visibility were verified with a private sentinel test; the sentinel and request capture are not included in this repository.
+
+## Full official envelope diagnostic
+
+After an exact 24-tool catalog alone still returned 429, `full-official` was expanded to reproduce the complete locally captured default envelope: default headers, system identity, startup `role: system` message, request defaults, and all official tools. Pi's appended system prompt and MCP tools are intentionally omitted in this diagnostic mode:
+
+```bash
+PI_ANYROUTER_CC_TOOL_PROFILE=full-official \
+PI_ANYROUTER_CC_MAX_RETRIES=0 \
+pi --no-extensions \
+  --extension ./index.ts \
+  --model anyrouter/claude-fable-5 \
+  --no-session --tools read,bash,edit,write \
+  -p "Reply with exactly OK. Do not call tools."
+```
+
+This mode is for a text-only acceptance probe. It advertises captured official tools even when no pi handler exists. If Claude calls one of those diagnostic-only tools, the adapter fails closed before pi executes anything. Do not use this mode for normal agent sessions until every required tool has a safe handler.
+
+For approved minimum-set experiments, select names without changing their captured ordering or schemas:
+
+```bash
+PI_ANYROUTER_CC_TOOL_PROFILE=full-official \
+PI_ANYROUTER_CC_OFFICIAL_TOOLS=Agent,Bash,Edit,Read,Skill,TaskCreate,TaskGet,TaskList,TaskUpdate,WebFetch,WebSearch,Write \
+# ...same pi command...
+```
+
+Unknown/duplicate/empty selections fail before any request.
+
+## Controlled live probes
+
+Live probes are intentionally double-gated and must be run only after explicit approval for that exact batch:
+
+```bash
+PI_ANYROUTER_CC_ALLOW_LIVE=1 \
+PI_ANYROUTER_CC_MAX_RETRIES=0 \
+npm run probe -- --live --request candidate-request.json
+```
+
+Without both `--live` and `PI_ANYROUTER_CC_ALLOW_LIVE=1`, the probe refuses to send anything. It prints only status, request ID, latency, structural request hash, response size, and a redacted/truncated error.
+
+Recommended acceptance order:
+
+1. Official Claude Code default/core/core+MCP control matrix.
+2. Candidate Fetch request with the accepted body shape.
+3. Text streaming for each configured Claude model.
+4. Full `Read`, `Bash`, and one MCP-mapped tool call/result/final-answer loop.
+5. Multi-turn replay, reasoning, cancellation, and sanitized error handling.
+
+## Debugging and privacy
+
+Runtime debug dumps are disabled by default:
 
 ```bash
 PI_ANYROUTER_CC_DEBUG=1 \
-PI_ANYROUTER_CC_DEBUG_DIR=/tmp/anyrouter-cc-debug \
-pi --model anyrouter/gpt-5.6-sol -p "Reply with exactly OK"
+PI_ANYROUTER_CC_DEBUG_DIR=/tmp/anyrouter-private-debug \
+pi --model anyrouter/claude-fable-5
 ```
 
-Default debug output directory:
+Authorization headers are redacted and newly created files use mode `0600`, but request bodies can still contain user prompts, images, tool schemas, paths, and tool results. Treat the entire debug directory as private and delete it when no longer needed.
 
-- `.pi/anyrouter-cc-debug/`
+The profile loader fails before a Claude request when:
 
-If AnyRouter intermittently returns `HTTP 520` / `Origin Error`, this package retries transient upstream failures automatically with exponential backoff. You can tune the retry count with `PI_ANYROUTER_CC_MAX_RETRIES`.
+- the profile is missing;
+- permissions allow group/other access;
+- version, billing attribution, user-agent, or structural hashes disagree;
+- credential-like fields are present;
+- required core tools/placeholders are missing.
 
-The runtime uses SSE by default (`PI_ANYROUTER_CC_STREAM_MODE=force`). For troubleshooting, you can force old behavior with:
+Codex models do not require a Claude profile.
 
-```bash
-PI_ANYROUTER_CC_STREAM_MODE=off pi --model anyrouter/claude-opus-4-8 -p "Reply with exactly OK"
-```
+## Activation and rollback
 
-## Share as a pi package
+After approved acceptance:
 
-This repo is already structured as a pi package through `package.json`:
+1. Back up `~/.pi/agent/settings.json` and `~/.pi/agent/anyrouter.json`.
+2. Install the pinned Git package with `pi install git:github.com/JCloud77/pi-anyrouter@v0.4.0-alpha.1`.
+3. Add `claudeProfile` to `anyrouter.json`.
+4. Run `/reload` and verify `/model`.
 
-```json
-{
-  "keywords": ["pi-package"],
-  "pi": {
-    "extensions": ["./index.ts"]
-  }
-}
-```
+Rollback is immediate: restore both backups, reload pi, and the original managed v0.3.2 checkout is active again.
 
-That means users can install it with:
+## Upstream attribution
 
-```bash
-pi install git:github.com/xifan2333/pi-anyrouter
-```
+This repository is a fork of [xifan2333/pi-anyrouter](https://github.com/xifan2333/pi-anyrouter), which is based on [phy-zhangzl/pi-anyrouter-cc](https://github.com/phy-zhangzl/pi-anyrouter-cc) by zhenliangzhang. The original MIT copyright and permission notices are preserved unchanged in [LICENSE](LICENSE).
 
-## Publish checklist
-
-### Publish to GitHub
-
-```bash
-git init
-git add .
-git commit -m "feat: add AnyRouter Claude and Codex adapters"
-git branch -M main
-git remote add origin git@github.com:xifan2333/pi-anyrouter.git
-git push -u origin main
-```
-
-### Optional npm publish
-
-If you want npm distribution too:
-
-```bash
-npm publish
-```
-
-Then users can install with:
-
-```bash
-pi install npm:pi-anyrouter
-```
-
-## Important behavior
-
-This package implements the Claude Code / Claude Agent SDK and Codex Responses Lite request shapes currently accepted by AnyRouter.
-
-If AnyRouter changes its validation again, enable debug dumps and compare the request shape against fresh official client captures.
-
-## Credits
-
-Based on [pi-anyrouter-cc](https://github.com/phy-zhangzl/pi-anyrouter-cc) by zhenliangzhang, licensed under the MIT License.
-
-This is an unofficial community project and is not affiliated with Anthropic, OpenAI, or AnyRouter.
+The profile-driven Claude compatibility layer and its tests are modifications in this fork. This is an unofficial community project and is not affiliated with Anthropic, OpenAI, or AnyRouter.
 
 ## License
 
-MIT. See [LICENSE](LICENSE) for the original and modification copyright notices.
+Distributed under the MIT License. See [LICENSE](LICENSE).

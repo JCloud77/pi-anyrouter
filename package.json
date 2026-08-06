@@ -1,6 +1,6 @@
 {
-  "name": "pi-anyrouter",
-  "version": "0.3.2",
+  "name": "@jcloud77/pi-anyrouter",
+  "version": "0.4.0-alpha.1",
   "private": false,
   "type": "module",
   "description": "Unofficial pi provider extension for AnyRouter Claude Code and Codex Responses Lite routes",
@@ -17,14 +17,16 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/xifan2333/pi-anyrouter.git"
+    "url": "git+https://github.com/JCloud77/pi-anyrouter.git"
   },
-  "homepage": "https://github.com/xifan2333/pi-anyrouter#readme",
+  "homepage": "https://github.com/JCloud77/pi-anyrouter#readme",
   "bugs": {
-    "url": "https://github.com/xifan2333/pi-anyrouter/issues"
+    "url": "https://github.com/JCloud77/pi-anyrouter/issues"
   },
   "files": [
     "index.ts",
+    "src",
+    "scripts",
     "README.md"
   ],
   "pi": {
@@ -33,6 +35,11 @@
     ]
   },
   "scripts": {
+    "capture:profile": "node scripts/capture-claude-profile.ts",
+    "diagnose": "node scripts/diff-claude-requests.ts",
+    "probe": "node scripts/probe-anyrouter.ts",
+    "test": "node --test tests/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json",
     "pack:dry-run": "npm pack --dry-run"
   },
   "dependencies": {
@@ -49,5 +56,9 @@
     "@earendil-works/pi-coding-agent": {
       "optional": true
     }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.83.0",
+    "typescript": "^5.9.3"
   }
 }

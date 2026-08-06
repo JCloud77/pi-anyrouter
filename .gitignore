@@ -1,7 +1,12 @@
 node_modules/
 .pi/
+profiles/
+captures/
+debug/
 *.tgz
 *.log
+*.capture.json
+*.profile.json
 .env
 .env.*
 !.env.example
