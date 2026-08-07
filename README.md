@@ -41,7 +41,7 @@ Unsupported built-in semantics fail safely rather than being silently changed. E
 Install the pinned Git prerelease through pi's package manager:
 
 ```bash
-pi install git:github.com/JCloud77/pi-anyrouter@v0.4.0-alpha.1
+pi install git:github.com/JCloud77/pi-anyrouter@v0.4.0-alpha.2
 ```
 
 Pi packages execute with full user permissions. Review the source before installation. This package does not include a Claude Code profile, API key, or generated request captures; each user must create those privately on their own machine.
@@ -183,10 +183,11 @@ After an exact 24-tool catalog alone still returned 429, `full-official` was exp
 
 ```bash
 PI_ANYROUTER_CC_TOOL_PROFILE=full-official \
+PI_ANYROUTER_CC_PI_INSTRUCTIONS=omit \
 PI_ANYROUTER_CC_MAX_RETRIES=0 \
 pi --no-extensions \
   --extension ./index.ts \
-  --model anyrouter/claude-fable-5 \
+  --model anyrouter/claude-opus-5 \
   --no-session --tools read,bash,edit,write \
   -p "Reply with exactly OK. Do not call tools."
 ```
@@ -202,6 +203,35 @@ PI_ANYROUTER_CC_OFFICIAL_TOOLS=Agent,Bash,Edit,Read,Skill,TaskCreate,TaskGet,Tas
 ```
 
 Unknown/duplicate/empty selections fail before any request.
+
+## Privacy-safe environment diagnostic
+
+Generate an offline report from the local configuration, private profile, runtime, and existing debug directory:
+
+```bash
+npm run diagnose:environment -- \
+  --debug-dir /tmp/pi-anyrouter-debug \
+  --output /tmp/pi-anyrouter-safe-report.json
+```
+
+The report is mode `0600` and intentionally excludes API keys, proxy URLs, hostnames, request bodies, prompts, raw device/session IDs, and system/tool template text. It contains only structural names, counts, lengths, hashes, booleans, statuses, and request IDs. Review it before sharing anyway. Never share the underlying profile or `*-request.json` files.
+
+An explicitly gated live matrix can compare three paths using the same local key and selected private debug request:
+
+1. official Claude Code with default tools and empty setting sources;
+2. exact debug request replay through Fetch/Undici;
+3. the same replay through curl HTTP/2, when supported.
+
+```bash
+PI_ANYROUTER_CC_ALLOW_LIVE=1 \
+npm run diagnose:environment -- \
+  --debug-dir /tmp/pi-anyrouter-debug \
+  --live-matrix \
+  --model claude-opus-5 \
+  --output /tmp/pi-anyrouter-live-safe-report.json
+```
+
+The live matrix makes three real requests (two when curl lacks HTTP/2). Fetch/curl replays are zero-retry; the official Claude CLI controls its own internal retry behavior. Without `PI_ANYROUTER_CC_ALLOW_LIVE=1`, live mode refuses to run.
 
 ## Controlled live probes
 
@@ -250,7 +280,7 @@ Codex models do not require a Claude profile.
 After approved acceptance:
 
 1. Back up `~/.pi/agent/settings.json` and `~/.pi/agent/anyrouter.json`.
-2. Install the pinned Git package with `pi install git:github.com/JCloud77/pi-anyrouter@v0.4.0-alpha.1`.
+2. Install the pinned Git package with `pi install git:github.com/JCloud77/pi-anyrouter@v0.4.0-alpha.2`.
 3. Add `claudeProfile` to `anyrouter.json`.
 4. Run `/reload` and verify `/model`.
 

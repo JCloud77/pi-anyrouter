@@ -1,6 +1,6 @@
 {
   "name": "@jcloud77/pi-anyrouter",
-  "version": "0.4.0-alpha.1",
+  "version": "0.4.0-alpha.2",
   "private": false,
   "type": "module",
   "description": "Unofficial pi provider extension for AnyRouter Claude Code and Codex Responses Lite routes",
@@ -37,6 +37,7 @@
   "scripts": {
     "capture:profile": "node scripts/capture-claude-profile.ts",
     "diagnose": "node scripts/diff-claude-requests.ts",
+    "diagnose:environment": "node scripts/diagnose-environment.ts",
     "probe": "node scripts/probe-anyrouter.ts",
     "test": "node --test tests/*.test.ts",
     "typecheck": "tsc -p tsconfig.json",
