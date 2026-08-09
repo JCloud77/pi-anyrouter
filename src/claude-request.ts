@@ -97,8 +97,51 @@ function userContentBlocks(message: Extract<Message, { role: "user" }>) {
     : { type: "image", source: { type: "base64", media_type: item.mimeType, data: item.data } });
 }
 
+function transcriptJson(value: any) {
+  try {
+    return sanitizeText(JSON.stringify(value, null, 2) ?? String(value));
+  } catch {
+    return "[arguments could not be serialized]";
+  }
+}
+
+function compatibilityReason(error: unknown) {
+  return sanitizeText(error instanceof Error ? error.message : String(error));
+}
+
+function historicalToolCallBlock(block: any, reason: string): JsonObject {
+  return {
+    type: "text",
+    text: [
+      "[Historical pi tool call replayed as text; it has already occurred and must not be executed again.]",
+      `Tool: ${sanitizeText(String(block.name || "unknown"))}`,
+      `Arguments:\n${transcriptJson(block.arguments)}`,
+      `Compatibility note: ${reason}`,
+    ].join("\n"),
+  };
+}
+
+function historicalToolResultBlocks(toolMessage: ToolResultMessage, toolName: string): JsonObject[] {
+  const prefix = [
+    "[Historical pi tool result replayed as text; it is context only.]",
+    `Tool: ${sanitizeText(toolName)}`,
+    `Status: ${toolMessage.isError ? "error" : "success"}`,
+  ].join("\n");
+  const converted = convertContentBlocks(toolMessage.content);
+  if (typeof converted === "string") {
+    return [{ type: "text", text: converted ? `${prefix}\nResult:\n${converted}` : prefix }];
+  }
+  return [{ type: "text", text: prefix }, ...converted];
+}
+
 export function convertClaudeMessages(messages: Message[], registry: ClaudeToolRegistry) {
   const params: JsonObject[] = [];
+  const resultIds = new Set(messages
+    .filter((message): message is ToolResultMessage => message.role === "toolResult")
+    .map((message) => message.toolCallId));
+  const wireToolCallIds = new Set<string>();
+  const transcriptToolCalls = new Map<string, { name: string; reason: string }>();
+
   for (let index = 0; index < messages.length; index++) {
     const message = messages[index];
     if (message.role === "user") {
@@ -120,8 +163,16 @@ export function convertClaudeMessages(messages: Message[], registry: ClaudeToolR
             content.push({ type: "text", text: sanitizeText(thinking.thinking) });
           }
         } else if (block.type === "toolCall") {
-          const wire = registry.toWireToolCall(block.name, block.arguments);
-          content.push({ type: "tool_use", id: block.id, name: wire.name, input: wire.input });
+          try {
+            if (!resultIds.has(block.id)) throw new Error("historical tool call has no matching result");
+            const wire = registry.toWireToolCall(block.name, block.arguments);
+            wireToolCallIds.add(block.id);
+            content.push({ type: "tool_use", id: block.id, name: wire.name, input: wire.input });
+          } catch (error) {
+            const reason = compatibilityReason(error);
+            transcriptToolCalls.set(block.id, { name: block.name, reason });
+            content.push(historicalToolCallBlock(block, reason));
+          }
         }
       }
       if (content.length) params.push({ role: "assistant", content });
@@ -130,13 +181,20 @@ export function convertClaudeMessages(messages: Message[], registry: ClaudeToolR
 
     if (message.role === "toolResult") {
       const toolResults: JsonObject[] = [];
+      const transcriptResults: JsonObject[] = [];
       const addToolResult = (toolMessage: ToolResultMessage) => {
-        toolResults.push({
-          type: "tool_result",
-          tool_use_id: toolMessage.toolCallId,
-          content: convertContentBlocks(toolMessage.content),
-          is_error: toolMessage.isError,
-        });
+        if (wireToolCallIds.has(toolMessage.toolCallId)) {
+          toolResults.push({
+            type: "tool_result",
+            tool_use_id: toolMessage.toolCallId,
+            content: convertContentBlocks(toolMessage.content),
+            is_error: toolMessage.isError,
+          });
+          return;
+        }
+        const transcript = transcriptToolCalls.get(toolMessage.toolCallId);
+        const toolName = transcript?.name || toolMessage.toolName || "unknown";
+        transcriptResults.push(...historicalToolResultBlocks(toolMessage, toolName));
       };
       addToolResult(message as ToolResultMessage);
       let next = index + 1;
@@ -145,7 +203,7 @@ export function convertClaudeMessages(messages: Message[], registry: ClaudeToolR
         next++;
       }
       index = next - 1;
-      params.push({ role: "user", content: toolResults });
+      params.push({ role: "user", content: [...toolResults, ...transcriptResults] });
     }
   }
   return params;

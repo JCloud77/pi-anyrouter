@@ -30,11 +30,11 @@ For Claude models the extension:
    - `web_search` ↔ `WebSearch`
    - `fetch_content` ↔ `WebFetch`
 5. Advertises every other active pi tool using a deterministic `mcp__pi__<name>_<hash>` wire name, then maps returned calls back to the original tool.
-6. Replays the same mapping for historical tool calls in multi-turn conversations.
+6. Replays representable historical tool calls with the same mapping. Batched `Edit`, multi-query `WebSearch`, multi-URL `WebFetch`, unavailable extension tools, orphan results, and other incompatible history are converted into inert text transcripts instead of blocking the next request or being executed again.
 7. Provides `compatible-core`, which uses the accepted official default envelope with the six safely mapped core tools.
 8. Provides an opt-in `full-official` diagnostic profile that reproduces the captured default Claude Code headers, system blocks, startup messages, request defaults, and exact tool catalog ordering.
 
-Unsupported built-in semantics fail safely rather than being silently changed. Examples include Claude `Edit.replace_all`, background Bash, and PDF page-specific Read calls.
+Unsupported semantics in newly emitted tool calls fail safely before execution rather than being silently changed. Historical calls that already ran are preserved as context-only text when their old pi shape cannot be represented by the current official schema.
 
 ## Install
 

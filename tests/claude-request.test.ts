@@ -153,17 +153,49 @@ test("replays MCP/core tool calls and groups tool results", () => {
   assert.equal(body.messages[3].content[0].type, "image");
 });
 
-test("requires a user turn and rejects unsupported historical edits", () => {
+test("requires a user turn and safely transcribes incompatible historical tool calls", () => {
   const profile = makeSyntheticProfile();
   assert.throws(
     () => buildClaudeRequest(profile, model, context([]), undefined, "00000000-0000-4000-8000-000000000003"),
     /at least one user message/,
   );
-  assert.throws(
-    () => buildClaudeRequest(profile, model, context([
-      { role: "user", content: "x" },
-      { role: "assistant", content: [{ type: "toolCall", id: "1", name: "edit", arguments: { path: "a", edits: [{ oldText: "x", newText: "y" }, { oldText: "z", newText: "q" }] } }] },
-    ]), undefined, "00000000-0000-4000-8000-000000000004"),
-    /exactly one pi edit entry/,
-  );
+
+  const calls = [
+    { type: "toolCall", id: "edit-1", name: "edit", arguments: { path: "a", edits: [{ oldText: "x", newText: "y" }, { oldText: "z", newText: "q" }] } },
+    { type: "toolCall", id: "search-1", name: "web_search", arguments: { queries: ["one", "two"] } },
+    { type: "toolCall", id: "fetch-1", name: "fetch_content", arguments: { urls: ["https://a", "https://b"] } },
+    { type: "toolCall", id: "todo-1", name: "todo", arguments: { action: "list" } },
+    { type: "toolCall", id: "read-1", name: "read", arguments: { path: "/tmp/a" } },
+  ];
+  const results = calls.map((call) => ({
+    role: "toolResult",
+    toolCallId: call.id,
+    toolName: call.name,
+    content: [{ type: "text", text: `${call.name} completed` }],
+    isError: false,
+  }));
+  const { body } = buildClaudeRequest(profile, model, context([
+    { role: "user", content: "continue prior work" },
+    { role: "assistant", content: calls },
+    ...results,
+  ]), undefined, "00000000-0000-4000-8000-000000000004", "compatible-core");
+
+  const assistant = body.messages[2];
+  assert.equal(assistant.content.filter((block: any) => block.type === "tool_use").length, 1);
+  assert.equal(assistant.content.find((block: any) => block.type === "tool_use").name, "Read");
+  const transcript = assistant.content.filter((block: any) => block.type === "text").map((block: any) => block.text).join("\n");
+  assert.match(transcript, /Tool: edit/);
+  assert.match(transcript, /Tool: web_search/);
+  assert.match(transcript, /Tool: fetch_content/);
+  assert.match(transcript, /Tool: todo/);
+  assert.match(transcript, /must not be executed again/);
+
+  const resultMessage = body.messages[3];
+  assert.equal(resultMessage.content[0].type, "tool_result");
+  assert.equal(resultMessage.content[0].tool_use_id, "read-1");
+  assert.equal(resultMessage.content.filter((block: any) => block.type === "tool_result").length, 1);
+  const resultTranscript = resultMessage.content.filter((block: any) => block.type === "text").map((block: any) => block.text).join("\n");
+  assert.match(resultTranscript, /Tool: edit/);
+  assert.match(resultTranscript, /edit completed/);
+  assert.match(resultTranscript, /Tool: todo/);
 });
