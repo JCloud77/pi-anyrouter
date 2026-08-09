@@ -133,6 +133,7 @@ test("replays MCP/core tool calls and groups tool results", () => {
     { role: "user", content: "do work" },
     {
       role: "assistant",
+      provider: "anyrouter",
       content: [
         { type: "thinking", thinking: "private thought", thinkingSignature: "signature" },
         { type: "toolCall", id: "toolu_1", name: "todo", arguments: { action: "list" } },
@@ -161,11 +162,11 @@ test("requires a user turn and safely transcribes incompatible historical tool c
   );
 
   const calls = [
-    { type: "toolCall", id: "edit-1", name: "edit", arguments: { path: "a", edits: [{ oldText: "x", newText: "y" }, { oldText: "z", newText: "q" }] } },
-    { type: "toolCall", id: "search-1", name: "web_search", arguments: { queries: ["one", "two"] } },
-    { type: "toolCall", id: "fetch-1", name: "fetch_content", arguments: { urls: ["https://a", "https://b"] } },
-    { type: "toolCall", id: "todo-1", name: "todo", arguments: { action: "list" } },
-    { type: "toolCall", id: "read-1", name: "read", arguments: { path: "/tmp/a" } },
+    { type: "toolCall", id: "toolu_edit_1", name: "edit", arguments: { path: "a", edits: [{ oldText: "x", newText: "y" }, { oldText: "z", newText: "q" }] } },
+    { type: "toolCall", id: "toolu_search_1", name: "web_search", arguments: { queries: ["one", "two"] } },
+    { type: "toolCall", id: "toolu_fetch_1", name: "fetch_content", arguments: { urls: ["https://a", "https://b"] } },
+    { type: "toolCall", id: "toolu_todo_1", name: "todo", arguments: { action: "list" } },
+    { type: "toolCall", id: "toolu_read_1", name: "read", arguments: { path: "/tmp/a" } },
   ];
   const results = calls.map((call) => ({
     role: "toolResult",
@@ -176,7 +177,7 @@ test("requires a user turn and safely transcribes incompatible historical tool c
   }));
   const { body } = buildClaudeRequest(profile, model, context([
     { role: "user", content: "continue prior work" },
-    { role: "assistant", content: calls },
+    { role: "assistant", provider: "anyrouter", content: calls },
     ...results,
   ]), undefined, "00000000-0000-4000-8000-000000000004", "compatible-core");
 
@@ -192,10 +193,33 @@ test("requires a user turn and safely transcribes incompatible historical tool c
 
   const resultMessage = body.messages[3];
   assert.equal(resultMessage.content[0].type, "tool_result");
-  assert.equal(resultMessage.content[0].tool_use_id, "read-1");
+  assert.equal(resultMessage.content[0].tool_use_id, "toolu_read_1");
   assert.equal(resultMessage.content.filter((block: any) => block.type === "tool_result").length, 1);
   const resultTranscript = resultMessage.content.filter((block: any) => block.type === "text").map((block: any) => block.text).join("\n");
   assert.match(resultTranscript, /Tool: edit/);
   assert.match(resultTranscript, /edit completed/);
   assert.match(resultTranscript, /Tool: todo/);
+});
+
+test("drops foreign reasoning signatures and transcribes foreign tool protocols", () => {
+  const profile = makeSyntheticProfile();
+  const { body } = buildClaudeRequest(profile, model, context([
+    { role: "user", content: "continue cross-provider work" },
+    {
+      role: "assistant",
+      provider: "openai-codex",
+      content: [
+        { type: "thinking", thinking: "foreign private reasoning", thinkingSignature: "foreign-encrypted-signature" },
+        { type: "toolCall", id: "call_openai_123", name: "read", arguments: { path: "/tmp/a" } },
+      ],
+    },
+    { role: "toolResult", toolCallId: "call_openai_123", toolName: "read", content: [{ type: "text", text: "old result" }], isError: false },
+  ]), undefined, "00000000-0000-4000-8000-000000000009", "compatible-core");
+
+  const assistant = body.messages[2];
+  assert.deepEqual(assistant.content.map((block: any) => block.type), ["text"]);
+  assert.match(assistant.content[0].text, /provider openai-codex/);
+  assert.doesNotMatch(JSON.stringify(body.messages), /foreign private reasoning|foreign-encrypted-signature/);
+  assert.equal(body.messages[3].content.some((block: any) => block.type === "tool_result"), false);
+  assert.match(body.messages[3].content[0].text, /Historical pi tool result replayed as text/);
 });

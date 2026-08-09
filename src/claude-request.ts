@@ -152,19 +152,25 @@ export function convertClaudeMessages(messages: Message[], registry: ClaudeToolR
 
     if (message.role === "assistant") {
       const content: JsonObject[] = [];
+      const isAnyRouterHistory = message.provider === "anyrouter";
       for (const block of message.content) {
         if (block.type === "text" && block.text.trim()) {
           content.push({ type: "text", text: sanitizeText(block.text) });
         } else if (block.type === "thinking" && block.thinking.trim()) {
           const thinking = block as ThinkingContent;
-          if (thinking.thinkingSignature) {
+          // Reasoning signatures are provider-specific cryptographic payloads. Replaying
+          // Codex or another provider's signature as Claude thinking makes the request invalid.
+          // Unsigned historical reasoning is also intentionally omitted rather than exposed as text.
+          if (isAnyRouterHistory && thinking.thinkingSignature) {
             content.push({ type: "thinking", thinking: sanitizeText(thinking.thinking), signature: thinking.thinkingSignature });
-          } else {
-            content.push({ type: "text", text: sanitizeText(thinking.thinking) });
           }
         } else if (block.type === "toolCall") {
           try {
+            if (!isAnyRouterHistory) {
+              throw new Error(`tool protocol belongs to provider ${message.provider || "unknown"}, not AnyRouter Claude`);
+            }
             if (!resultIds.has(block.id)) throw new Error("historical tool call has no matching result");
+            if (!String(block.id).startsWith("toolu_")) throw new Error("historical tool call id is not a Claude toolu_ id");
             const wire = registry.toWireToolCall(block.name, block.arguments);
             wireToolCallIds.add(block.id);
             content.push({ type: "tool_use", id: block.id, name: wire.name, input: wire.input });
