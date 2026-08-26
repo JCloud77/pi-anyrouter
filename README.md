@@ -41,7 +41,7 @@ Unsupported semantics in newly emitted tool calls fail safely before execution r
 Install the pinned Git prerelease through pi's package manager:
 
 ```bash
-pi install git:github.com/JCloud77/pi-anyrouter@v0.4.0-alpha.2
+pi install git:github.com/JCloud77/pi-anyrouter@v0.4.0-alpha.3
 ```
 
 Pi packages execute with full user permissions. Review the source before installation. This package does not include a Claude Code profile, API key, or generated request captures; each user must create those privately on their own machine.
@@ -280,7 +280,7 @@ Codex models do not require a Claude profile.
 After approved acceptance:
 
 1. Back up `~/.pi/agent/settings.json` and `~/.pi/agent/anyrouter.json`.
-2. Install the pinned Git package with `pi install git:github.com/JCloud77/pi-anyrouter@v0.4.0-alpha.2`.
+2. Install the pinned Git package with `pi install git:github.com/JCloud77/pi-anyrouter@v0.4.0-alpha.3`.
 3. Add `claudeProfile` to `anyrouter.json`.
 4. Run `/reload` and verify `/model`.
 
