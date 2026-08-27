@@ -149,9 +149,55 @@ test("replays MCP/core tool calls and groups tool results", () => {
   assert.deepEqual(assistant.content.map((block: any) => block.type), ["thinking", "tool_use", "tool_use"]);
   assert.equal(assistant.content[1].name, "mcp__pi__todo_602fae58");
   assert.deepEqual(assistant.content[2].input, { file_path: "/tmp/a", offset: 1 });
-  assert.equal(body.messages[2].content.length, 2);
+  assert.equal(body.messages[2].content.length, 3);
   assert.equal(body.messages[2].content[0].tool_use_id, "toolu_1");
-  assert.equal(body.messages[3].content[0].type, "image");
+  assert.equal(body.messages[2].content[2].type, "image");
+});
+
+test("removes adapter retry artifacts and restores valid Claude history ordering", () => {
+  const profile = makeSyntheticProfile();
+  const messages = [
+    { role: "user", content: "start" },
+    {
+      role: "assistant",
+      provider: "anyrouter",
+      errorMessage: "[anyrouter] terminated",
+      content: [
+        { type: "text", text: "⏳ 429 — retrying (1/10)…" },
+        { type: "text", text: "⏳ incomplete stream — retrying (2/10)…" },
+        { type: "thinking", thinking: "valid private thought", thinkingSignature: "valid-signature" },
+        { type: "text", text: "model-authored text" },
+        { type: "toolCall", id: "toolu_retry_1", name: "read", arguments: { path: "/tmp/a" } },
+        { type: "text", text: "[anyrouter] terminated" },
+      ],
+    },
+    { role: "toolResult", toolCallId: "toolu_retry_1", toolName: "read", content: [{ type: "text", text: "read result" }], isError: false },
+    {
+      role: "assistant",
+      provider: "anyrouter",
+      content: [
+        { type: "text", text: "⏳ 429 — retrying (1/10)…" },
+        { type: "text", text: "⏳ 429 — retrying (2/10)…" },
+      ],
+    },
+    { role: "user", content: "continue" },
+  ];
+
+  const { body } = buildClaudeRequest(
+    profile,
+    model,
+    context(messages),
+    undefined,
+    "00000000-0000-4000-8000-000000000010",
+    "compatible-core",
+  );
+
+  assert.deepEqual(body.messages.map((message: any) => message.role), ["user", "system", "assistant", "user"]);
+  assert.deepEqual(body.messages[2].content.map((block: any) => block.type), ["thinking", "text", "tool_use"]);
+  assert.equal(body.messages[2].content[0].signature, "valid-signature");
+  assert.deepEqual(body.messages[3].content.map((block: any) => block.type), ["tool_result", "text"]);
+  assert.equal(body.messages[3].content[1].text, "continue");
+  assert.doesNotMatch(JSON.stringify(body.messages), /retrying|\[anyrouter\] terminated/);
 });
 
 test("requires a user turn and safely transcribes incompatible historical tool calls", () => {

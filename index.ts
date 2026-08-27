@@ -23,7 +23,15 @@ import { readClaudeProfile } from "./src/claude-profile.ts";
 import { buildClaudeRequest, createClaudeHeaders } from "./src/claude-request.ts";
 import { ClaudeToolRegistry } from "./src/claude-tools.ts";
 import { getRetryDelayMs, isRetryableStatus, parseRetryAfterMs } from "./src/retry.ts";
-import { nextSseChunk, parseSseEvent } from "./src/sse.ts";
+import {
+  canRetryIncompleteClaudeStream,
+  createClaudeSseCompletionState,
+  getClaudeSseCompletionError,
+  nextSseChunk,
+  observeClaudeSsePayload,
+  parseSseEvent,
+  type ClaudeSseCompletionState,
+} from "./src/sse.ts";
 
 type Json = Record<string, any>;
 type StreamMode = "off" | "auto" | "force";
@@ -259,7 +267,7 @@ function updateUsageFromAnthropic(output: AssistantMessage, usage: any, model: M
 function resetOutputState(output: AssistantMessage) {
   output.content = [];
   output.usage = createEmptyUsage();
-  output.stopReason = "stop";
+  output.stopReason = "pending";
   output.errorMessage = undefined;
   output.responseId = undefined;
 }
@@ -505,7 +513,7 @@ function applyCodexSsePayload(payload: any, output: AssistantMessage, stream: As
 
 async function tryStreamAnyRouterCodex(url: string, body: Json, apiKey: string, model: Model<Api>, output: AssistantMessage, stream: AssistantMessageEventStream, sessionId: string, metadata: ReturnType<typeof createCodexMetadata>, signal?: AbortSignal) {
   const bodyText = JSON.stringify(body);
-  const maxRetries = Math.max(0, Number(process.env.PI_ANYROUTER_CC_MAX_RETRIES || "10") || 0);
+  const maxRetries = Math.max(0, Number(process.env.PI_ANYROUTER_CC_MAX_RETRIES || "0") || 0);
   let response: Response | undefined;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -531,7 +539,7 @@ async function tryStreamAnyRouterCodex(url: string, body: Json, apiKey: string, 
       response = undefined;
       continue;
     }
-    throw new Error(raw || `HTTP ${response.status}`);
+    throw new Error(`HTTP ${response.status}${raw ? `: ${raw}` : ""}`);
   }
 
   if (!response?.body) throw new Error("Codex stream response body missing");
@@ -609,7 +617,8 @@ function applyJsonResponseToOutput(response: any, output: AssistantMessage, stre
   }
 }
 
-function applySsePayloadEvent(payload: any, output: AssistantMessage, stream: AssistantMessageEventStream, model: Model<Api>, blockIndexByEventIndex: Map<number, number>, registry: ClaudeToolRegistry) {
+function applySsePayloadEvent(payload: any, output: AssistantMessage, stream: AssistantMessageEventStream, model: Model<Api>, blockIndexByEventIndex: Map<number, number>, registry: ClaudeToolRegistry, completion: ClaudeSseCompletionState) {
+  observeClaudeSsePayload(completion, payload);
   if (!payload?.type || payload.type === "ping" || payload.type === "message_stop") return;
 
   if (payload.type === "error") {
@@ -739,8 +748,7 @@ function applySsePayloadEvent(payload: any, output: AssistantMessage, stream: As
 async function tryStreamAnyRouterCc(url: string, body: Json, headers: Record<string, string>, model: Model<Api>, output: AssistantMessage, stream: AssistantMessageEventStream, registry: ClaudeToolRegistry, signal?: AbortSignal) {
   const requestBody = { ...body, stream: true };
   const bodyText = JSON.stringify(requestBody);
-  const maxRetries = Math.max(0, Number(process.env.PI_ANYROUTER_CC_MAX_RETRIES || "10") || 0);
-  let response: Response | undefined;
+  const maxRetries = Math.max(0, Number(process.env.PI_ANYROUTER_CC_MAX_RETRIES || "0") || 0);
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     // Real Claude Code keeps x-stainless-retry-count at zero across its application-level retries.
@@ -753,6 +761,7 @@ async function tryStreamAnyRouterCc(url: string, body: Json, headers: Record<str
       });
     }
 
+    let response: Response;
     try {
       response = await fetchWithProxy(url, {
         method: "POST",
@@ -769,91 +778,133 @@ async function tryStreamAnyRouterCc(url: string, body: Json, headers: Record<str
     }
 
     const contentType = response.headers.get("content-type") || "";
-    if (response.ok && contentType.includes("text/event-stream")) break;
+    if (!response.ok || !contentType.includes("text/event-stream")) {
+      const raw = await response.text();
+      const parsed = tryParseJson(raw) || { raw };
+      const requestId = extractRequestId(parsed, response.headers);
+      writeDebugFile(response.ok ? "response" : "error", model.id, requestId, {
+        status: response.status,
+        statusText: response.statusText,
+        requestId,
+        headers: Object.fromEntries(response.headers.entries()),
+        body: parsed,
+        raw,
+        transport: "sse",
+        retryAttempt: attempt,
+        maxRetries,
+      });
 
-    const raw = await response.text();
-    const parsed = tryParseJson(raw) || { raw };
-    const requestId = extractRequestId(parsed, response.headers);
-    writeDebugFile(response.ok ? "response" : "error", model.id, requestId, {
+      if (!response.ok && attempt < maxRetries && isRetryableStatus(response.status)) {
+        // Retry state belongs in diagnostics, never in assistant content: persisting it
+        // would corrupt the next turn's Claude message history.
+        await delay(getRetryDelayMs(attempt, parseRetryAfterMs(response.headers.get("retry-after"))));
+        continue;
+      }
+      if (response.ok) throw new Error(`stream response was not SSE (content-type=${contentType || "<missing>"})`);
+      throw new Error(`HTTP ${response.status}${raw ? `: ${raw}` : ""}`);
+    }
+
+    const completion = createClaudeSseCompletionState();
+    const blockIndexByEventIndex = new Map<number, number>();
+
+    try {
+      if (!response.body) throw new Error("stream response body missing");
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let reachedTerminalEvent = false;
+
+      readLoop: while (true) {
+        const { value, done } = await reader.read();
+        buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+
+        let parsedChunk = nextSseChunk(buffer);
+        while (parsedChunk) {
+          buffer = parsedChunk.rest;
+          const event = parseSseEvent(parsedChunk.chunk);
+          if (event.data) {
+            const payload = tryParseJson(event.data);
+            if (!payload && event.data !== "[DONE]") throw new Error(`invalid SSE payload: ${event.data.slice(0, 200)}`);
+            if (payload) applySsePayloadEvent(payload, output, stream, model, blockIndexByEventIndex, registry, completion);
+            if (completion.sawMessageStop) {
+              reachedTerminalEvent = true;
+              break;
+            }
+          }
+          parsedChunk = nextSseChunk(buffer);
+        }
+
+        if (reachedTerminalEvent) break readLoop;
+        if (done) break;
+      }
+
+      if (reachedTerminalEvent) {
+        // message_stop is the terminal Anthropic event. Do not wait for a
+        // potentially unreliable proxy connection to close after completion.
+        await reader.cancel().catch(() => undefined);
+      } else {
+        const tail = buffer.trim();
+        if (tail) {
+          const event = parseSseEvent(tail);
+          if (event.data && event.data !== "[DONE]") {
+            const payload = tryParseJson(event.data);
+            if (!payload) throw new Error(`invalid SSE payload: ${event.data.slice(0, 200)}`);
+            applySsePayloadEvent(payload, output, stream, model, blockIndexByEventIndex, registry, completion);
+          }
+        }
+      }
+
+      const completionError = getClaudeSseCompletionError(completion);
+      if (completionError) throw new Error(completionError);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      writeDebugFile("error", model.id, response.headers.get("x-oneapi-request-id") || undefined, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: Object.fromEntries(response.headers.entries()),
+        body: {
+          phase: "sse-consume",
+          errorMessage,
+          completion,
+        },
+        transport: "sse",
+        retryAttempt: attempt,
+        maxRetries,
+      });
+
+      if (attempt < maxRetries && !signal?.aborted && canRetryIncompleteClaudeStream(completion)) {
+        // No model content was emitted, so retrying cannot duplicate text or
+        // execute a tool call twice. Clear all partial state; retry diagnostics
+        // must never become model-authored assistant history.
+        resetOutputState(output);
+        await delay(getRetryDelayMs(attempt));
+        continue;
+      }
+      throw error;
+    }
+
+    writeDebugFile("response", model.id, response.headers.get("x-oneapi-request-id") || undefined, {
       status: response.status,
       statusText: response.statusText,
-      requestId,
       headers: Object.fromEntries(response.headers.entries()),
-      body: parsed,
-      raw,
+      body: {
+        responseId: output.responseId,
+        stopReason: output.stopReason,
+        usage: output.usage,
+        contentBlocks: output.content.length,
+        completion,
+      },
       transport: "sse",
-      retryAttempt: attempt,
-      maxRetries,
     });
-
-    if (!response.ok && attempt < maxRetries && isRetryableStatus(response.status)) {
-      // Push visible retry feedback so pi's UI shows activity instead of a frozen "working" status.
-      const retryBlockIndex = output.content.length;
-      const retryText = `⏳ ${response.status} — retrying (${attempt + 1}/${maxRetries})…`;
-      output.content.push({ type: "text", text: retryText } as any);
-      stream.push({ type: "text_start", contentIndex: retryBlockIndex, partial: output });
-      stream.push({ type: "text_delta", contentIndex: retryBlockIndex, delta: retryText, partial: output });
-      stream.push({ type: "text_end", contentIndex: retryBlockIndex, content: retryText, partial: output });
-      await delay(getRetryDelayMs(attempt, parseRetryAfterMs(response.headers.get("retry-after"))));
-      response = undefined;
-      continue;
-    }
-    if (response.ok) throw new Error(`stream response was not SSE (content-type=${contentType || "<missing>"})`);
-    throw new Error(raw || `HTTP ${response.status}`);
+    return;
   }
 
-  if (!response?.body) throw new Error("stream response body missing");
-
-  const blockIndexByEventIndex = new Map<number, number>();
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  while (true) {
-    const { value, done } = await reader.read();
-    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
-
-    let parsedChunk = nextSseChunk(buffer);
-    while (parsedChunk) {
-      buffer = parsedChunk.rest;
-      const event = parseSseEvent(parsedChunk.chunk);
-      if (event.data) {
-        const payload = tryParseJson(event.data);
-        if (!payload && event.data !== "[DONE]") throw new Error(`invalid SSE payload: ${event.data.slice(0, 200)}`);
-        if (payload) applySsePayloadEvent(payload, output, stream, model, blockIndexByEventIndex, registry);
-      }
-      parsedChunk = nextSseChunk(buffer);
-    }
-
-    if (done) break;
-  }
-
-  const tail = buffer.trim();
-  if (tail) {
-    const event = parseSseEvent(tail);
-    if (event.data && event.data !== "[DONE]") {
-      const payload = tryParseJson(event.data);
-      if (!payload) throw new Error(`invalid SSE payload: ${event.data.slice(0, 200)}`);
-      applySsePayloadEvent(payload, output, stream, model, blockIndexByEventIndex, registry);
-    }
-  }
-
-  writeDebugFile("response", model.id, response.headers.get("x-oneapi-request-id") || undefined, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: Object.fromEntries(response.headers.entries()),
-    body: {
-      responseId: output.responseId,
-      stopReason: output.stopReason,
-      usage: output.usage,
-      contentBlocks: output.content.length,
-    },
-    transport: "sse",
-  });
+  throw new Error("Claude SSE request failed after retries");
 }
 
 async function postJson(url: string, body: Json, headers: Record<string, string>, modelId: string, signal?: AbortSignal) {
-  const maxRetries = Math.max(0, Number(process.env.PI_ANYROUTER_CC_MAX_RETRIES || "10") || 0);
+  const maxRetries = Math.max(0, Number(process.env.PI_ANYROUTER_CC_MAX_RETRIES || "0") || 0);
   const jsonBody = { ...body, stream: false };
   const bodyText = JSON.stringify(jsonBody);
   let lastErrorText = "";
@@ -911,7 +962,7 @@ async function postJson(url: string, body: Json, headers: Record<string, string>
       await delay(getRetryDelayMs(attempt, parseRetryAfterMs(response.headers.get("retry-after"))));
       continue;
     }
-    throw new Error(text || `HTTP ${response.status}`);
+    throw new Error(`HTTP ${response.status}${text ? `: ${text}` : ""}`);
   }
 
   throw new Error(lastErrorText || "HTTP request failed after retries");
@@ -927,7 +978,7 @@ function streamAnyRouterCc(model: Model<Api>, context: Context, options?: Simple
       provider: model.provider,
       model: model.id,
       usage: createEmptyUsage(),
-      stopReason: "stop",
+      stopReason: "pending",
       timestamp: Date.now(),
     };
 
@@ -987,20 +1038,10 @@ function streamAnyRouterCc(model: Model<Api>, context: Context, options?: Simple
           return;
         } catch (streamError) {
           if (streamMode === "force" || output.content.length > 0) {
-            // All retries exhausted. Push a text block with the error so pi
-            // shows it, then end with done/stop to prevent pi from auto-retrying
-            // the entire provider stream.
-            const errText = `[anyrouter] ${streamError instanceof Error ? streamError.message : String(streamError)}`;
-            const contentIndex = output.content.length;
-            output.content.push({ type: "text", text: errText } as any);
-            output.stopReason = "stop";
-            output.errorMessage = errText;
-            stream.push({ type: "text_start", contentIndex, partial: output });
-            stream.push({ type: "text_delta", contentIndex, delta: errText, partial: output });
-            stream.push({ type: "text_end", contentIndex, content: errText, partial: output });
-            stream.push({ type: "done", reason: "stop", message: output });
-            stream.end();
-            return;
+            // A failed or incomplete stream is not a successful assistant turn.
+            // Propagate it so pi will not execute tool calls parsed from a
+            // potentially truncated response and will not treat empty output as done.
+            throw streamError;
           }
           writeDebugFile("error", model.id, undefined, {
             phase: "stream-fallback",

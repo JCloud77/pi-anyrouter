@@ -134,6 +134,25 @@ function historicalToolResultBlocks(toolMessage: ToolResultMessage, toolName: st
   return [{ type: "text", text: prefix }, ...converted];
 }
 
+const RETRY_FEEDBACK_PATTERN = /^⏳ .+ — retrying \(\d+\/\d+\)…$/u;
+
+function isAdapterGeneratedAssistantText(message: Extract<Message, { role: "assistant" }>, text: string) {
+  const trimmed = text.trim();
+  if (RETRY_FEEDBACK_PATTERN.test(trimmed)) return true;
+  const errorMessage = typeof (message as any).errorMessage === "string" ? (message as any).errorMessage.trim() : "";
+  return Boolean(errorMessage && trimmed === errorMessage && trimmed.startsWith("[anyrouter]"));
+}
+
+function appendConvertedMessage(params: JsonObject[], role: "user" | "assistant", content: JsonObject[]) {
+  if (!content.length) return;
+  const previous = params.at(-1);
+  if (role === "user" && previous?.role === "user" && Array.isArray(previous.content)) {
+    previous.content.push(...content);
+    return;
+  }
+  params.push({ role, content });
+}
+
 export function convertClaudeMessages(messages: Message[], registry: ClaudeToolRegistry) {
   const params: JsonObject[] = [];
   const resultIds = new Set(messages
@@ -146,22 +165,27 @@ export function convertClaudeMessages(messages: Message[], registry: ClaudeToolR
     const message = messages[index];
     if (message.role === "user") {
       const content = userContentBlocks(message as Extract<Message, { role: "user" }>);
-      if (content.length) params.push({ role: "user", content });
+      appendConvertedMessage(params, "user", content);
       continue;
     }
 
     if (message.role === "assistant") {
       const content: JsonObject[] = [];
+      const assistantMessage = message as Extract<Message, { role: "assistant" }>;
       const isAnyRouterHistory = message.provider === "anyrouter";
+      let emittedNonThinkingBlock = false;
       for (const block of message.content) {
         if (block.type === "text" && block.text.trim()) {
+          if (isAnyRouterHistory && isAdapterGeneratedAssistantText(assistantMessage, block.text)) continue;
           content.push({ type: "text", text: sanitizeText(block.text) });
+          emittedNonThinkingBlock = true;
         } else if (block.type === "thinking" && block.thinking.trim()) {
           const thinking = block as ThinkingContent;
           // Reasoning signatures are provider-specific cryptographic payloads. Replaying
           // Codex or another provider's signature as Claude thinking makes the request invalid.
-          // Unsigned historical reasoning is also intentionally omitted rather than exposed as text.
-          if (isAnyRouterHistory && thinking.thinkingSignature) {
+          // Claude thinking must also remain before ordinary content; omit a late block
+          // rather than replaying a malformed assistant message.
+          if (isAnyRouterHistory && thinking.thinkingSignature && !emittedNonThinkingBlock) {
             content.push({ type: "thinking", thinking: sanitizeText(thinking.thinking), signature: thinking.thinkingSignature });
           }
         } else if (block.type === "toolCall") {
@@ -179,9 +203,10 @@ export function convertClaudeMessages(messages: Message[], registry: ClaudeToolR
             transcriptToolCalls.set(block.id, { name: block.name, reason });
             content.push(historicalToolCallBlock(block, reason));
           }
+          emittedNonThinkingBlock = true;
         }
       }
-      if (content.length) params.push({ role: "assistant", content });
+      appendConvertedMessage(params, "assistant", content);
       continue;
     }
 
@@ -209,7 +234,7 @@ export function convertClaudeMessages(messages: Message[], registry: ClaudeToolR
         next++;
       }
       index = next - 1;
-      params.push({ role: "user", content: [...toolResults, ...transcriptResults] });
+      appendConvertedMessage(params, "user", [...toolResults, ...transcriptResults]);
     }
   }
   return params;

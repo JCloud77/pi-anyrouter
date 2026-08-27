@@ -30,7 +30,7 @@ For Claude models the extension:
    - `web_search` ↔ `WebSearch`
    - `fetch_content` ↔ `WebFetch`
 5. Advertises every other active pi tool using a deterministic `mcp__pi__<name>_<hash>` wire name, then maps returned calls back to the original tool.
-6. Replays only genuine AnyRouter/Claude historical tool calls with Claude `toolu_` ids using the same mapping. Cross-provider tool protocols, batched `Edit`, multi-query `WebSearch`, multi-URL `WebFetch`, unavailable extension tools, orphan results, and other incompatible history are converted into inert text transcripts instead of blocking the next request or being executed again. Non-AnyRouter reasoning signatures are dropped because thinking signatures are provider-specific cryptographic payloads.
+6. Replays only genuine AnyRouter/Claude historical tool calls with Claude `toolu_` ids using the same mapping. Cross-provider tool protocols, batched `Edit`, multi-query `WebSearch`, multi-URL `WebFetch`, unavailable extension tools, orphan results, and other incompatible history are converted into inert text transcripts instead of blocking the next request or being executed again. Non-AnyRouter reasoning signatures are dropped because thinking signatures are provider-specific cryptographic payloads. Legacy adapter-generated retry/error text is removed, empty failed assistant turns are discarded, and adjacent user turns are merged so local transport status cannot corrupt Claude history ordering.
 7. Provides `compatible-core`, which uses the accepted official default envelope with the six safely mapped core tools.
 8. Provides an opt-in `full-official` diagnostic profile that reproduces the captured default Claude Code headers, system blocks, startup messages, request defaults, and exact tool catalog ordering.
 
@@ -103,12 +103,14 @@ Supported overrides:
 - `PI_ANYROUTER_CC_TOOL_PROFILE` (`compatible-core` default, legacy `executable`, or diagnostic-only `full-official`)
 - `PI_ANYROUTER_CC_OFFICIAL_TOOLS` (optional comma-separated subset for controlled minimum-set diagnosis)
 - `PI_ANYROUTER_CC_PI_INSTRUCTIONS` (`user-reminder` default with compatible-core, or `omit`)
-- `PI_ANYROUTER_CC_MAX_RETRIES` (runtime default: `10`; use `0` for controlled probes)
+- `PI_ANYROUTER_CC_MAX_RETRIES` (provider-local retry override; default: `0`, because pi's agent-level retry policy owns transient retries)
 - `PI_ANYROUTER_CC_STREAM_MODE` (`force`, `auto`, or `off`; default: `force`)
 - `PI_ANYROUTER_CC_DEBUG`
 - `PI_ANYROUTER_CC_DEBUG_DIR`
 
 Fetch/Undici remains the only enabled Claude runtime transport. A controlled same-body comparison returned the same 429 through Fetch and `curl --http2`, so curl is not implemented as a runtime fallback.
+
+Provider-local retries default to zero to avoid multiplying this extension's attempts by pi's agent-level retry policy (three retries by default). Empty or unterminated SSE responses and transient HTTP/transport failures are reported as real provider errors, so pi can apply its configured retry budget. Set `PI_ANYROUTER_CC_MAX_RETRIES` only when an explicit additional provider-local retry layer is desired. Retry progress is written only to diagnostics, never to assistant content, because persisting transport status beside Claude `thinking` or `tool_use` blocks would poison the next request's message envelope.
 
 ## Generate the private Claude Code profile
 

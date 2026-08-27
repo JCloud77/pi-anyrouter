@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { getRetryDelayMs, isRetryableStatus, parseRetryAfterMs } from "../src/retry.ts";
-import { nextSseChunk, parseSseEvent, parseSseJson } from "../src/sse.ts";
+import {
+  canRetryIncompleteClaudeStream,
+  createClaudeSseCompletionState,
+  getClaudeSseCompletionError,
+  nextSseChunk,
+  observeClaudeSsePayload,
+  parseSseEvent,
+  parseSseJson,
+} from "../src/sse.ts";
 
 test("parses Unix and CRLF SSE chunks incrementally", () => {
   const unix = nextSseChunk('event: ping\ndata: {"type":"ping"}\n\nrest');
@@ -17,6 +25,39 @@ test("parses Unix and CRLF SSE chunks incrementally", () => {
 test("validates JSON SSE data", () => {
   assert.deepEqual(parseSseJson('{"type":"message_stop"}'), { type: "message_stop" });
   assert.throws(() => parseSseJson("{broken", "Claude SSE"), /invalid Claude SSE payload/);
+});
+
+test("rejects empty and unterminated Claude SSE streams", () => {
+  const empty = createClaudeSseCompletionState();
+  assert.match(getClaudeSseCompletionError(empty) || "", /missing message_start/);
+  assert.equal(canRetryIncompleteClaudeStream(empty), true);
+
+  const started = createClaudeSseCompletionState();
+  observeClaudeSsePayload(started, { type: "message_start" });
+  assert.match(getClaudeSseCompletionError(started) || "", /missing message_delta stop_reason/);
+  assert.equal(canRetryIncompleteClaudeStream(started), true);
+});
+
+test("does not retry a truncated Claude stream after model content", () => {
+  const state = createClaudeSseCompletionState();
+  observeClaudeSsePayload(state, { type: "message_start" });
+  observeClaudeSsePayload(state, { type: "content_block_start", index: 0, content_block: { type: "tool_use" } });
+
+  assert.match(getClaudeSseCompletionError(state) || "", /incomplete content block/);
+  assert.equal(canRetryIncompleteClaudeStream(state), false);
+});
+
+test("accepts only a fully terminated Claude SSE stream", () => {
+  const state = createClaudeSseCompletionState();
+  observeClaudeSsePayload(state, { type: "message_start" });
+  observeClaudeSsePayload(state, { type: "content_block_start", index: 0, content_block: { type: "text" } });
+  observeClaudeSsePayload(state, { type: "content_block_stop", index: 0 });
+  observeClaudeSsePayload(state, { type: "message_delta", delta: { stop_reason: "end_turn" } });
+  assert.match(getClaudeSseCompletionError(state) || "", /before message_stop/);
+  observeClaudeSsePayload(state, { type: "message_stop" });
+
+  assert.equal(getClaudeSseCompletionError(state), undefined);
+  assert.equal(canRetryIncompleteClaudeStream(state), false);
 });
 
 test("classifies retry statuses and honors bounded Retry-After", () => {
