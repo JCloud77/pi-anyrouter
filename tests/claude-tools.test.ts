@@ -56,6 +56,37 @@ test("maps core arguments in both directions", () => {
   });
 });
 
+test("Read treats empty pages as omitted without changing file or line arguments", () => {
+  const profile = makeSyntheticProfile();
+  for (const mode of ["executable", "compatible-core", "full-official"] as const) {
+    const value = new ClaudeToolRegistry([makeTool("read")], profile, mode);
+    const input = { file_path: "/tmp/cases.json", offset: 0, limit: 300, pages: "" };
+    const mapped = value.fromWireToolCall("Read", input);
+    assert.deepEqual(mapped, {
+      name: "read", arguments: { path: input.file_path, offset: 0, limit: 300 },
+    }, mode);
+    assert.deepEqual(mapped, value.fromWireToolCall("Read", {
+      file_path: input.file_path, offset: 0, limit: 300,
+    }));
+    assert.deepEqual(value.fromWireToolCall("Read", { file_path: input.file_path, pages: "" }), {
+      name: "read", arguments: { path: input.file_path },
+    });
+    assert.deepEqual(value.toWireToolCall(mapped.name, mapped.arguments), {
+      name: "Read", input: { file_path: input.file_path, offset: 0, limit: 300 },
+    });
+    assert.equal(input.pages, "", "mapping must not mutate the original arguments");
+  }
+});
+
+test("Read still rejects nonempty pages and invalid types instead of silently reading everything", () => {
+  const value = registry();
+  for (const file_path of ["/tmp/cases.json", "/tmp/document.pdf"]) {
+    for (const pages of ["1", "1-2", " ", "\t", "invalid", null, false, 0, [], {}]) {
+      assert.throws(() => value.fromWireToolCall("Read", { file_path, pages }), /pages is not supported/);
+    }
+  }
+});
+
 test("MCP mappings are deterministic, collision-safe, and schema preserving", () => {
   const tools = [
     makeTool("A B", { value: { type: "string" } }, ["value"]),

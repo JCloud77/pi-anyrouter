@@ -87,7 +87,12 @@ function fromWireCore(wireName: string, value: any): JsonObject {
   const args = objectArguments(value, wireName);
   switch (wireName) {
     case "Read": {
-      if (args.pages !== undefined) throw new Error("Claude Read pages is not supported by pi read");
+      // Some Messages-compatible models emit an empty optional pages field for
+      // ordinary text reads. Drop only that no-op value; reject real page
+      // selections and malformed types because Pi cannot preserve their meaning.
+      if (args.pages !== undefined && args.pages !== "") {
+        throw new Error("Claude Read pages is not supported by pi read");
+      }
       return { path: args.file_path, ...copyDefined(args, ["offset", "limit"]) };
     }
     case "Bash": {
@@ -203,11 +208,11 @@ export class ClaudeToolRegistry {
         if (!this.byWireName.has(name)) this.diagnosticOnlyWireNames.add(name);
       }
     } else if (toolProfile === "compatible-core") {
-      this.tools = profile.request.coreToolNames.map((name) => clone(profile.request.toolCatalog[name]));
-      for (const name of profile.request.coreToolNames) {
-        this.advertisedWireNames.add(name);
-        if (!this.byWireName.has(name)) this.diagnosticOnlyWireNames.add(name);
-      }
+      // Preserve captured order/schema, but never promise an inactive Pi tool.
+      // Only full-official may advertise diagnostic-only, unhandled tools.
+      const names = profile.request.coreToolNames.filter((name) => this.byWireName.has(name));
+      this.tools = names.map((name) => clone(profile.request.toolCatalog[name]));
+      for (const name of names) this.advertisedWireNames.add(name);
     } else {
       this.tools = bindings.map((binding) => clone(binding.wireTool));
       for (const binding of bindings) this.advertisedWireNames.add(binding.wireName);

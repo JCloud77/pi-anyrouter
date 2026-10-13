@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
-import { homedir } from "node:os";
+import { homedir, platform, arch } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
@@ -22,6 +22,8 @@ import {
 import { readClaudeProfile } from "./src/claude-profile.ts";
 import { buildClaudeRequest, createClaudeHeaders } from "./src/claude-request.ts";
 import { ClaudeToolRegistry } from "./src/claude-tools.ts";
+import { resolveClaudeContext, type ClaudeContext } from "./src/claude-context.ts";
+import { getAstraCodexVersion } from "./src/codex-client.ts";
 import { getRetryDelayMs, isRetryableStatus, parseRetryAfterMs } from "./src/retry.ts";
 import {
   canRetryIncompleteClaudeStream,
@@ -69,6 +71,9 @@ const DEBUG_ENABLED = process.env.PI_ANYROUTER_CC_DEBUG === "1";
 const DEBUG_DIR = process.env.PI_ANYROUTER_CC_DEBUG_DIR || join(process.cwd(), ".pi", "anyrouter-cc-debug");
 const CODEX_VERSION = "0.144.1";
 const CODEX_INSTALLATION_ID = randomUUID();
+// Astra's metadata links requests within one Pi user turn. Keep only bounded,
+// non-sensitive fingerprints; never retain the user prompt in this map.
+const ASTRA_ROOT_TURNS = new Map<string, { fingerprint: string; rootTurnId: string }>();
 
 function sanitizeText(text: string) {
   return text.replace(/[\uD800-\uDFFF]/g, "\uFFFD");
@@ -273,7 +278,9 @@ function resetOutputState(output: AssistantMessage) {
 }
 
 function isCodexModel(modelId: string, configuredApi?: string) {
-  if (configuredApi) return configuredApi === "openai-codex-responses";
+  if (configuredApi === "openai-codex-responses") return true;
+  if (configuredApi === "anthropic-messages") return false;
+  if (configuredApi) throw new Error(`Unsupported AnyRouter model api ${configuredApi}`);
   return /(?:^|[-_.])(gpt|codex)(?:[-_.]|$)/i.test(modelId) || /^o\d(?:[-_.]|$)/i.test(modelId);
 }
 
@@ -361,13 +368,27 @@ function convertCodexTools(tools: Tool[]) {
   }));
 }
 
-function createCodexMetadata(sessionId: string, turnId: string) {
+function getAstraRootTurnId(sessionId: string, context: Context, turnId: string) {
+  const users = context.messages.filter((message) => message.role === "user");
+  const lastUser = users.at(-1);
+  const fingerprint = createHash("sha256")
+    .update(JSON.stringify([users.length, lastUser?.timestamp, lastUser?.content]))
+    .digest("hex");
+  const current = ASTRA_ROOT_TURNS.get(sessionId);
+  if (current?.fingerprint === fingerprint) return current.rootTurnId;
+  ASTRA_ROOT_TURNS.set(sessionId, { fingerprint, rootTurnId: turnId });
+  if (ASTRA_ROOT_TURNS.size > 256) ASTRA_ROOT_TURNS.delete(ASTRA_ROOT_TURNS.keys().next().value!);
+  return turnId;
+}
+
+function createCodexMetadata(sessionId: string, turnId: string, rootTurnId?: string) {
   const windowId = `${sessionId}:0`;
   const turnMetadata = JSON.stringify({
     installation_id: CODEX_INSTALLATION_ID,
     session_id: sessionId,
     thread_id: sessionId,
     turn_id: turnId,
+    ...(rootTurnId ? { root_turn_id: rootTurnId } : {}),
     window_id: windowId,
     request_kind: "turn",
     thread_source: "user",
@@ -380,6 +401,7 @@ function createCodexMetadata(sessionId: string, turnId: string) {
       session_id: sessionId,
       thread_id: sessionId,
       turn_id: turnId,
+      ...(rootTurnId ? { root_turn_id: rootTurnId } : {}),
       "x-codex-installation-id": CODEX_INSTALLATION_ID,
       "x-codex-window-id": windowId,
       "x-codex-turn-metadata": turnMetadata,
@@ -387,13 +409,15 @@ function createCodexMetadata(sessionId: string, turnId: string) {
   };
 }
 
-function createCodexHeaders(apiKey: string, sessionId: string, metadata: ReturnType<typeof createCodexMetadata>) {
+function createCodexHeaders(apiKey: string, sessionId: string, metadata: ReturnType<typeof createCodexMetadata>, astraVersion?: string) {
   return {
     authorization: `Bearer ${apiKey}`,
     accept: "text/event-stream",
     "content-type": "application/json",
     originator: "codex_exec",
-    "user-agent": `codex_exec/${CODEX_VERSION} (Linux; x86_64) (codex_exec; ${CODEX_VERSION})`,
+    "user-agent": astraVersion
+      ? `codex_exec/${astraVersion} (${platform()}; ${arch()}) (codex_exec; ${astraVersion})`
+      : `codex_exec/${CODEX_VERSION} (Linux; x86_64) (codex_exec; ${CODEX_VERSION})`,
     "x-openai-internal-codex-responses-lite": "true",
     "x-codex-beta-features": "remote_compaction_v2",
     "x-codex-window-id": metadata.windowId,
@@ -404,10 +428,13 @@ function createCodexHeaders(apiKey: string, sessionId: string, metadata: ReturnT
   };
 }
 
-function buildCodexRequestBody(model: Model<Api>, context: Context, options: SimpleStreamOptions | undefined, sessionId: string, metadata: ReturnType<typeof createCodexMetadata>) {
+function buildCodexRequestBody(model: Model<Api>, context: Context, options: SimpleStreamOptions | undefined, sessionId: string, metadata: ReturnType<typeof createCodexMetadata>, astra = false) {
+  // Pi 0.87+ sends active tools and system sections in transcript system messages.
+  // Keep the old Codex path byte-for-byte compatible; normalize only Astra.
+  const resolved = astra ? resolveClaudeContext(context as ClaudeContext) : context;
   const body: Json = {
     model: model.id,
-    input: convertCodexMessages(context),
+    input: convertCodexMessages(resolved),
     tool_choice: "auto",
     parallel_tool_calls: false,
     reasoning: {
@@ -417,12 +444,12 @@ function buildCodexRequestBody(model: Model<Api>, context: Context, options: Sim
     store: false,
     stream: true,
     text: { verbosity: "low" },
-    max_output_tokens: options?.maxTokens || model.maxTokens,
+    ...(astra ? {} : { max_output_tokens: options?.maxTokens || model.maxTokens }),
     include: ["reasoning.encrypted_content"],
     prompt_cache_key: sessionId,
     client_metadata: metadata.clientMetadata,
   };
-  if (context.tools?.length) body.tools = convertCodexTools(context.tools);
+  if (resolved.tools?.length) body.tools = convertCodexTools(resolved.tools);
   return body;
 }
 
@@ -439,7 +466,7 @@ function applyCodexUsage(output: AssistantMessage, response: any, model: Model<A
   calculateCost(model, output.usage);
 }
 
-function applyCodexSsePayload(payload: any, output: AssistantMessage, stream: AssistantMessageEventStream, model: Model<Api>, slots: Map<number, any>) {
+function applyCodexSsePayload(payload: any, output: AssistantMessage, stream: AssistantMessageEventStream, model: Model<Api>, slots: Map<number, any>, allowedTools?: ReadonlySet<string>) {
   const type = payload?.type;
   if (!type || type === "response.in_progress" || type === "response.metadata") return;
   if (type === "error") throw new Error(payload.message || JSON.stringify(payload));
@@ -465,6 +492,7 @@ function applyCodexSsePayload(payload: any, output: AssistantMessage, stream: As
       slots.set(payload.output_index, { type: "thinking", block, contentIndex });
       stream.push({ type: "thinking_start", contentIndex, partial: output });
     } else if (item?.type === "function_call") {
+      if (allowedTools && !allowedTools.has(item.name)) throw new Error(`Codex returned unadvertised tool ${String(item.name)}`);
       const block = { type: "toolCall", id: `${item.call_id}|${item.id}`, name: item.name, arguments: {}, partialJson: item.arguments || "" };
       output.content.push(block as any);
       const contentIndex = output.content.length - 1;
@@ -511,13 +539,13 @@ function applyCodexSsePayload(payload: any, output: AssistantMessage, stream: As
   }
 }
 
-async function tryStreamAnyRouterCodex(url: string, body: Json, apiKey: string, model: Model<Api>, output: AssistantMessage, stream: AssistantMessageEventStream, sessionId: string, metadata: ReturnType<typeof createCodexMetadata>, signal?: AbortSignal) {
+async function tryStreamAnyRouterCodex(url: string, body: Json, apiKey: string, model: Model<Api>, output: AssistantMessage, stream: AssistantMessageEventStream, sessionId: string, metadata: ReturnType<typeof createCodexMetadata>, signal?: AbortSignal, astraVersion?: string) {
   const bodyText = JSON.stringify(body);
   const maxRetries = Math.max(0, Number(process.env.PI_ANYROUTER_CC_MAX_RETRIES || "0") || 0);
   let response: Response | undefined;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    const headers = createCodexHeaders(apiKey, sessionId, metadata);
+    const headers = createCodexHeaders(apiKey, sessionId, metadata, astraVersion);
     if (attempt === 0) writeDebugFile("request", model.id, undefined, { url, headers: redactHeaders(headers), body, transport: "codex-sse" });
     try {
       response = await fetchWithProxy(url, { method: "POST", signal, headers, body: bodyText });
@@ -544,6 +572,9 @@ async function tryStreamAnyRouterCodex(url: string, body: Json, apiKey: string, 
 
   if (!response?.body) throw new Error("Codex stream response body missing");
   const slots = new Map<number, any>();
+  const allowedTools = astraVersion
+    ? new Set<string>((body.tools ?? []).map((tool: { name: string }) => tool.name))
+    : undefined;
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -558,7 +589,7 @@ async function tryStreamAnyRouterCodex(url: string, body: Json, apiKey: string, 
       if (event.data && event.data !== "[DONE]") {
         const payload = tryParseJson(event.data);
         if (!payload) throw new Error(`invalid Codex SSE payload: ${event.data.slice(0, 200)}`);
-        applyCodexSsePayload(payload, output, stream, model, slots);
+        applyCodexSsePayload(payload, output, stream, model, slots, allowedTools);
         if (payload.type === "response.completed" || payload.type === "response.incomplete") terminal = true;
       }
       parsedChunk = nextSseChunk(buffer);
@@ -571,7 +602,7 @@ async function tryStreamAnyRouterCodex(url: string, body: Json, apiKey: string, 
     if (event.data && event.data !== "[DONE]") {
       const payload = tryParseJson(event.data);
       if (!payload) throw new Error(`invalid Codex SSE payload: ${event.data.slice(0, 200)}`);
-      applyCodexSsePayload(payload, output, stream, model, slots);
+      applyCodexSsePayload(payload, output, stream, model, slots, allowedTools);
       if (payload.type === "response.completed" || payload.type === "response.incomplete") terminal = true;
     }
   }
@@ -984,13 +1015,18 @@ function streamAnyRouterCc(model: Model<Api>, context: Context, options?: Simple
 
     try {
       const source = loadSourceProvider();
-      const sessionId = randomUUID();
-
       const configuredModel = source.models.find((item) => item.id === model.id);
+      // Pi supplies a stable sessionId across ordinary turns and tool continuations.
+      // Preserve the legacy per-request id for all other models.
+      const sessionId = model.id === "gpt-6-astra" && options?.sessionId
+        ? options.sessionId
+        : randomUUID();
       if (isCodexModel(model.id, configuredModel?.api)) {
+        const astraVersion = model.id === "gpt-6-astra" ? getAstraCodexVersion() : undefined;
         const turnId = randomUUID();
-        const metadata = createCodexMetadata(sessionId, turnId);
-        const codexBody = buildCodexRequestBody(model, context, options, sessionId, metadata);
+        const rootTurnId = astraVersion ? getAstraRootTurnId(sessionId, context, turnId) : undefined;
+        const metadata = createCodexMetadata(sessionId, turnId, rootTurnId);
+        const codexBody = buildCodexRequestBody(model, context, options, sessionId, metadata, Boolean(astraVersion));
         stream.push({ type: "start", partial: output });
         await tryStreamAnyRouterCodex(
           getCodexResponsesUrl(source.baseUrl),
@@ -1002,6 +1038,7 @@ function streamAnyRouterCc(model: Model<Api>, context: Context, options?: Simple
           sessionId,
           metadata,
           options?.signal,
+          astraVersion,
         );
         if (options?.signal?.aborted) throw new Error("Request was aborted");
         stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
@@ -1072,6 +1109,10 @@ function streamAnyRouterCc(model: Model<Api>, context: Context, options?: Simple
 export const __testing = {
   buildCodexRequestBody,
   createCodexHeaders,
+  applyCodexSsePayload,
+  getAstraRootTurnId,
+  createCodexMetadata,
+  isCodexModel,
 };
 
 export default function (pi: ExtensionAPI) {

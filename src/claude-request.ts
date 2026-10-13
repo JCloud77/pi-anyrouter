@@ -1,7 +1,6 @@
 import { homedir } from "node:os";
 import type {
   Api,
-  Context,
   ImageContent,
   Message,
   Model,
@@ -22,6 +21,7 @@ import {
   type JsonObject,
 } from "./claude-profile.ts";
 import { ClaudeToolRegistry, type ClaudeToolProfile } from "./claude-tools.ts";
+import { resolveClaudeContext, type ClaudeContext } from "./claude-context.ts";
 
 export type PiInstructionMode = "omit" | "user-reminder";
 
@@ -306,15 +306,16 @@ export function createClaudeMetadata(profile: ClaudeCodeProfile, sessionId: stri
 export function buildClaudeRequest(
   profile: ClaudeCodeProfile,
   model: Model<Api>,
-  context: Context,
+  context: ClaudeContext,
   options: SimpleStreamOptions | undefined,
   sessionId: string,
   toolProfile: ClaudeToolProfile = "executable",
   selectedOfficialToolNames?: string[],
   piInstructionMode: PiInstructionMode = "omit",
 ) {
-  const registry = new ClaudeToolRegistry(context.tools || [], profile, toolProfile, selectedOfficialToolNames);
-  const systemPrompt = context.systemPrompt || "You are an expert coding assistant operating inside pi.";
+  const resolvedContext = resolveClaudeContext(context);
+  const registry = new ClaudeToolRegistry(resolvedContext.tools || [], profile, toolProfile, selectedOfficialToolNames);
+  const systemPrompt = resolvedContext.systemPrompt || "You are an expert coding assistant operating inside pi.";
   const replacements = runtimeReplacements(model.id, systemPrompt);
   const systemTemplate = toolProfile === "executable"
     ? profile.request.systemTemplate
@@ -326,7 +327,7 @@ export function buildClaudeRequest(
     ? profile.request.bodyDefaults
     : profile.request.defaultBodyDefaults;
   const system = renderValue(systemTemplate, replacements);
-  const convertedMessages = convertClaudeMessages(context.messages, registry);
+  const convertedMessages = convertClaudeMessages(resolvedContext.messages, registry);
   const userReminder = toolProfile === "compatible-core" && piInstructionMode === "user-reminder"
     ? `<system-reminder>\nThe following instructions describe the pi host environment and must be followed for this session:\n${sanitizeText(systemPrompt)}\n</system-reminder>\n\n`
     : undefined;

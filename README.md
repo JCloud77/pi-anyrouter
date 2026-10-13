@@ -12,7 +12,7 @@ The Claude adapter uses a **locally generated, versioned Claude Code profile** i
 - Reads dedicated config `~/.pi/agent/anyrouter.json`.
 - Keeps normal pi `/model` selection.
 - Leaves other pi providers and global request handling untouched.
-- Preserves the v0.3.2 Codex Responses Lite request path.
+- Preserves the v0.3.2 Codex Responses Lite request path for existing models. An opt-in `gpt-6-astra` branch checks local Codex CLI >= 0.153.0, uses its version in the Codex user-agent, resolves Pi transcript tools/instructions, and rejects unadvertised tool calls before execution. This is locally tested, not yet confirmed by AnyRouter.
 - First profile/capture implementation targets Linux/WSL.
 
 ## Claude compatibility design
@@ -31,10 +31,22 @@ For Claude models the extension:
    - `fetch_content` ↔ `WebFetch`
 5. Advertises every other active pi tool using a deterministic `mcp__pi__<name>_<hash>` wire name, then maps returned calls back to the original tool.
 6. Replays only genuine AnyRouter/Claude historical tool calls with Claude `toolu_` ids using the same mapping. Cross-provider tool protocols, batched `Edit`, multi-query `WebSearch`, multi-URL `WebFetch`, unavailable extension tools, orphan results, and other incompatible history are converted into inert text transcripts instead of blocking the next request or being executed again. Non-AnyRouter reasoning signatures are dropped because thinking signatures are provider-specific cryptographic payloads. Legacy adapter-generated retry/error text is removed, empty failed assistant turns are discarded, and adjacent user turns are merged so local transport status cannot corrupt Claude history ordering.
-7. Provides `compatible-core`, which uses the accepted official default envelope with the six safely mapped core tools.
+7. Provides `compatible-core`, which uses the accepted official default envelope and advertises only the active, mapped subset of the six core tools, preserving captured order and schemas.
 8. Provides an opt-in `full-official` diagnostic profile that reproduces the captured default Claude Code headers, system blocks, startup messages, request defaults, and exact tool catalog ordering.
 
 Unsupported semantics in newly emitted tool calls fail safely before execution rather than being silently changed. Historical calls that already ran are preserved as context-only text when their old pi shape cannot be represented by the current official schema.
+
+The Claude route accepts both legacy `context.systemPrompt`/`context.tools` and Pi 0.87's normalized transcript context. It replays system-message prompt sections and tool additions/removals, so project instructions reach the user reminder and active tools retain their executable mappings. Tools disabled with `--no-tools`, `--tools`, or session tool changes are not advertised by `compatible-core`; calls to them still fail closed. With all six core tools active, the existing envelope is unchanged. Reduced tool catalogs have not been newly validated against AnyRouter and may be rejected by its gateway; do not work around that by advertising disabled tools. `full-official` remains a separate diagnostic-only mode.
+
+After updating the local extension, use `/reload` (or restart Pi) before retrying a failed tool turn. No profile recapture or model-ID change is needed for the transcript compatibility fix.
+
+An optional real-Pi integration test runs entirely against a loopback mock with an isolated configuration, dummy key, and synthetic profile:
+
+```bash
+PI_ANYROUTER_TEST_PI_BIN="$(command -v pi)" npm test
+```
+
+It checks a `Bash` call/result/final-answer loop and verifies that a disabled `Bash` cannot execute. Without this variable, `npm test` skips the CLI integration tests (Claude and Astra).
 
 ## Install
 
@@ -73,16 +85,25 @@ Create `~/.pi/agent/anyrouter.json` with permissions `0600`:
   "claudePiInstructions": "user-reminder",
   "models": [
     {
-      "id": "claude-fable-5",
-      "name": "Claude Fable 5",
+      "id": "claude-fable-5-1",
+      "name": "Claude Fable 5.1",
       "reasoning": true,
       "input": ["text", "image"],
       "contextWindow": 1000000,
       "maxTokens": 128000
     },
     {
-      "id": "claude-opus-5",
-      "name": "Claude Opus 5",
+      "id": "claude-opus-5-5",
+      "name": "Claude Opus 5.5",
+      "reasoning": true,
+      "input": ["text", "image"],
+      "contextWindow": 1000000,
+      "maxTokens": 128000
+    },
+    {
+      "id": "gpt-6-astra-cc-format",
+      "name": "GPT-6 Astra (CC Messages)",
+      "api": "anthropic-messages",
       "reasoning": true,
       "input": ["text", "image"],
       "contextWindow": 1000000,
@@ -107,6 +128,10 @@ Supported overrides:
 - `PI_ANYROUTER_CC_STREAM_MODE` (`force`, `auto`, or `off`; default: `force`)
 - `PI_ANYROUTER_CC_DEBUG`
 - `PI_ANYROUTER_CC_DEBUG_DIR`
+
+`gpt-6-astra-cc-format` explicitly sets `"api": "anthropic-messages"` in this adapter's **per-model routing configuration**. Although its name starts with `gpt`, it sends Claude Code-profiled requests to `/v1/messages` using the same base URL and key as other AnyRouter Claude models. It does not use the Responses adapter or require a local Codex CLI. The synthetic-profile loopback test verifies this routing, but AnyRouter acceptance has **not** been verified online. Do not mistake the routing setting for Pi's registered custom API id (`anyrouter-messages`).
+
+For `gpt-6-astra`, add a model with ID `gpt-6-astra` to `~/.pi/agent/anyrouter.json` only after the first accepted AnyRouter request. It uses the same `baseUrl` and `apiKey`; no Claude profile is used. A locally installed stable `codex --version` >= 0.153.0 must be on `PATH`. This branch does **not** claim to reproduce Codex's proprietary prompts or native namespace tool catalog: the adapter sends Pi's currently executable tools and Pi's own instructions. For Astra, `client_metadata.session_id`, `thread_id`, request headers, and the prompt cache key now use Pi's stable `options.sessionId`; `turn_id` changes per request, while `root_turn_id` stays fixed across a tool continuation and changes on the next user turn. Local loopback tests cover a real Pi `Bash` call/result/final-answer cycle, the metadata linkage, and disabled-tool rejection. Pi's `/compact` is its own summarization request and context rebuild, not proof of server-side Codex remote compaction. An online acceptance test is still required before enabling the model for normal sessions. Other Codex models retain their previous envelope and hardcoded version.
 
 Fetch/Undici remains the only enabled Claude runtime transport. A controlled same-body comparison returned the same 429 through Fetch and `curl --http2`, so curl is not implemented as a runtime fallback.
 
